@@ -1,0 +1,28 @@
+# LLM Wiki Schema
+
+Created: {{created}}
+
+## Required Files
+
+- `SCHEMA.md`
+- `index.md`
+- `log.md`
+- `memory-index.json`
+- `link-graph.json`
+- `query-log.jsonl`
+- `retrieval-evals.jsonl`
+- `raw/`
+- `wiki/`
+- `reports/`
+
+## Page Frontmatter
+
+Required fields: `title`, `slug`, `created`, `updated`, `type`, `summary`, `aliases`, `tags`, `sources`, `confidence`, `contested`.
+
+Allowed page types: `concept`, `entity`, `comparison`, `query`, `note`, `source-summary`.
+
+Allowed confidence values: `high`, `medium`, `low`, `unknown`.
+
+## Raw Source Policy
+
+Raw notes preserve source meaning. Do not silently rewrite source claims, replace prior raw notes, or delete raw source body text.
