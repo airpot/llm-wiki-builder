@@ -37,6 +37,7 @@ An LLM wiki is a user-owned directory, not this repository. The default structur
 4. Prefer scripts for deterministic operations:
    - Initialize with `scripts/init_wiki.py`.
    - Validate with `scripts/validate_wiki.py`.
+   - Run zero-LLM structural health checks with `scripts/health_check.py`.
    - Rebuild retrieval files with `scripts/build_memory_index.py`.
    - Retrieve candidate pages with `scripts/retrieve_wiki.py`.
    - Benchmark retrieval with `scripts/evaluate_retrieval.py`.
@@ -53,10 +54,11 @@ An LLM wiki is a user-owned directory, not this repository. The default structur
 - `references/conflict-handling.md`: source attribution, contradictions, contested pages, and confidence rules.
 - `references/external-patterns.md`: concise ecosystem patterns and isolation notes.
 - `scripts/init_wiki.py`: create missing wiki structure and baseline files without overwriting user files.
-- `scripts/validate_wiki.py`: validate wiki structure, frontmatter, links, JSON/JSONL files, and report health.
+- `scripts/validate_wiki.py`: validate wiki structure, frontmatter, links, JSON/JSONL files, generated artifact freshness, and source provenance.
+- `scripts/health_check.py`: run zero-LLM structural health checks for stubs, links, orphans, index coverage, log coverage, tags, and page size.
 - `scripts/build_memory_index.py`: rebuild `memory-index.json` and `link-graph.json` from `wiki/`.
 - `scripts/retrieve_wiki.py`: retrieve pages with deterministic lexical ranking and optional query logging.
-- `scripts/evaluate_retrieval.py`: run `retrieval-evals.jsonl` cases and write retrieval reports.
+- `scripts/evaluate_retrieval.py`: run `retrieval-evals.jsonl` cases and write ranking-aware retrieval reports.
 - `assets/templates/`: baseline output templates used by scripts and agent workflows.
 
 ## Guardrails

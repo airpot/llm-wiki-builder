@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import sys
 import tempfile
 from pathlib import Path
+
+sys.dont_write_bytecode = True
 
 from wiki_lib import REQUIRED_DIRS, REQUIRED_FILES, build_memory_artifacts, today, utc_now, write_json
 

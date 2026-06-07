@@ -5,10 +5,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import sys
 from pathlib import Path
 from typing import Any
 
+sys.dont_write_bytecode = True
+
 from wiki_lib import page_matches_identifier, read_jsonl, retrieve, write_report
+
+
+def first_matching_rank(hits: list[dict[str, Any]], identifier: str) -> int | None:
+    for index, hit in enumerate(hits, start=1):
+        if page_matches_identifier(hit, identifier):
+            return index
+    return None
+
+
+def discounted_gain(rank: int) -> float:
+    return 1.0 / math.log2(rank + 1)
 
 
 def evaluate_case(root: Path, case: dict[str, Any], limit: int) -> dict[str, Any]:
@@ -25,6 +40,19 @@ def evaluate_case(root: Path, case: dict[str, Any], limit: int) -> dict[str, Any
         if any(page_matches_identifier(hit, forbidden) for hit in hits):
             forbidden_hits.append(forbidden)
 
+    ranked_expected = {expected: first_matching_rank(hits, expected) for expected in expected_pages}
+    expected_ranks = [rank for rank in ranked_expected.values() if rank is not None]
+    first_expected_rank = min(expected_ranks) if expected_ranks else None
+    relevant_hits = len(expected_ranks)
+    ideal_relevant = min(len(expected_pages), limit)
+    dcg = sum(discounted_gain(rank) for rank in expected_ranks)
+    ideal_dcg = sum(discounted_gain(rank) for rank in range(1, ideal_relevant + 1))
+    metrics = {
+        "recall_at_k": (relevant_hits / len(expected_pages)) if expected_pages else 0.0,
+        "precision_at_k": relevant_hits / limit if limit else 0.0,
+        "mrr_at_k": (1.0 / first_expected_rank) if first_expected_rank else 0.0,
+        "ndcg_at_k": (dcg / ideal_dcg) if ideal_dcg else 0.0,
+    }
     missing_expected = [item for item in expected_pages if item not in matched_expected]
     unexpected_top_hit = None
     if hits and expected_pages and not any(page_matches_identifier(hits[0], expected) for expected in expected_pages):
@@ -40,8 +68,17 @@ def evaluate_case(root: Path, case: dict[str, Any], limit: int) -> dict[str, Any
         "matched_expected": matched_expected,
         "missing_expected": missing_expected,
         "forbidden_hits": forbidden_hits,
+        "ranked_expected": ranked_expected,
+        "first_expected_rank": first_expected_rank,
+        "metrics": metrics,
         "unexpected_top_hit": unexpected_top_hit,
     }
+
+
+def average_metric(results: list[dict[str, Any]], name: str) -> float:
+    if not results:
+        return 0.0
+    return sum(float(result.get("metrics", {}).get(name, 0.0)) for result in results) / len(results)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -87,6 +124,13 @@ def main() -> int:
         "cases": total,
         "passed": passed,
         "hit_rate": hit_rate,
+        "metrics": {
+            "recall_at_k": average_metric(results, "recall_at_k"),
+            "precision_at_k": average_metric(results, "precision_at_k"),
+            "mrr_at_k": average_metric(results, "mrr_at_k"),
+            "ndcg_at_k": average_metric(results, "ndcg_at_k"),
+            "k": args.limit,
+        },
         "missing_expected": missing_expected,
         "unexpected_top_hits": unexpected_top_hits,
         "forbidden_hits": forbidden_hits,
@@ -101,6 +145,10 @@ def main() -> int:
             f"- Cases: {total}",
             f"- Passed: {passed}",
             f"- Hit rate: {hit_rate:.3f}",
+            f"- Recall@{args.limit}: {report['metrics']['recall_at_k']:.3f}",
+            f"- Precision@{args.limit}: {report['metrics']['precision_at_k']:.3f}",
+            f"- MRR@{args.limit}: {report['metrics']['mrr_at_k']:.3f}",
+            f"- nDCG@{args.limit}: {report['metrics']['ndcg_at_k']:.3f}",
             "",
             "## Missing Expected Pages",
         ]
@@ -127,6 +175,10 @@ def main() -> int:
         print(f"cases: {total}")
         print(f"passed: {passed}")
         print(f"hit_rate: {hit_rate:.3f}")
+        print(f"recall_at_{args.limit}: {report['metrics']['recall_at_k']:.3f}")
+        print(f"precision_at_{args.limit}: {report['metrics']['precision_at_k']:.3f}")
+        print(f"mrr_at_{args.limit}: {report['metrics']['mrr_at_k']:.3f}")
+        print(f"ndcg_at_{args.limit}: {report['metrics']['ndcg_at_k']:.3f}")
         print(f"missing_expected: {len(missing_expected)}")
         print(f"unexpected_top_hits: {len(unexpected_top_hits)}")
     return 0 if not missing_expected and not forbidden_hits else 1

@@ -25,6 +25,7 @@
     queries/
   reports/
     validation/
+    health/
     optimization/
     retrieval/
 ```
@@ -68,8 +69,11 @@ Recommended raw note metadata:
 - `source_type`
 - `source_path`
 - `source_hash`
+- `sha256`
 - `ingested_at`
 - `extraction_status`
+
+When `sha256` or `source_hash` is present, it should be the SHA-256 hash of the source body after the closing frontmatter delimiter. Validation recomputes this body hash and reports drift when the raw source body changes.
 
 If the user explicitly requests raw note deletion, archival, or replacement, record it in `log.md`.
 
@@ -77,4 +81,4 @@ If the user explicitly requests raw note deletion, archival, or replacement, rec
 
 `index.md` is the human-facing table of contents and should list compiled wiki pages. `memory-index.json` and `link-graph.json` are generated files. `log.md` is append-oriented and records initialization, ingest, safe fixes, optimization plans, accepted write-mode changes, and benchmark runs.
 
-`query-log.jsonl` entries should include timestamp, query text, selected page identifiers, miss status, and retrieval mode. `retrieval-evals.jsonl` cases require `id`, `query`, and `expected_pages`; optional fields are `forbidden_pages`, `tags`, and `notes`.
+`query-log.jsonl` entries should include timestamp, query text, selected page identifiers, miss status, and retrieval mode. `retrieval-evals.jsonl` cases require `id`, `query`, and `expected_pages`; optional fields are `forbidden_pages`, `tags`, and `notes`. Retrieval reports include hit rate plus ranking-aware metrics: `recall_at_k`, `precision_at_k`, `mrr_at_k`, and `ndcg_at_k`.

@@ -12,8 +12,11 @@ Validate:
 - JSONL shape for `query-log.jsonl` and `retrieval-evals.jsonl`;
 - internal Markdown link targets;
 - index coverage for compiled pages;
-- memory index freshness;
+- memory index and link graph freshness, including content drift after page edits;
+- local source path existence and optional raw body hash provenance;
 - retrieval eval schema.
+
+Run `scripts/health_check.py` for zero-LLM structural preflight. It reports empty/stub pages, broken Markdown links, broken wikilinks, orphan pages, index completeness, log coverage, tag taxonomy drift, and page size warnings without applying fixes.
 
 ## Safe-Fix Mode
 
@@ -47,4 +50,4 @@ Write optimization reports under `reports/optimization/` and append `log.md`.
 
 `retrieval-evals.jsonl` cases require `id`, `query`, and `expected_pages`. Optional fields: `forbidden_pages`, `tags`, `notes`.
 
-When optimization changes retrieval-relevant files, rerun the benchmark or state why it could not run, then compare before/after metrics in the report.
+`scripts/evaluate_retrieval.py` reports hit rate plus `recall_at_k`, `precision_at_k`, `mrr_at_k`, and `ndcg_at_k`. When optimization changes retrieval-relevant files, rerun the benchmark or state why it could not run, then compare before/after metrics in the report.

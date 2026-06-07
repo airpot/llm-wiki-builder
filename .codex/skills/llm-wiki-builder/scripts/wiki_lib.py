@@ -3,12 +3,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+sys.dont_write_bytecode = True
 
 
 REQUIRED_FILES = [
@@ -31,6 +35,7 @@ REQUIRED_DIRS = [
     "wiki/comparisons",
     "wiki/queries",
     "reports/validation",
+    "reports/health",
     "reports/optimization",
     "reports/retrieval",
 ]
@@ -57,6 +62,7 @@ TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
 MARKDOWN_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
 WIKI_LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
+URL_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
 
 
 def utc_now() -> str:
@@ -95,6 +101,10 @@ def append_jsonl(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(data, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def stable_json(data: Any) -> str:
+    return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def append_log(root: Path, message: str) -> None:
@@ -142,6 +152,19 @@ def parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     return metadata, body
 
 
+def source_body_hash(body: str) -> str:
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def file_body_hash(path: Path) -> tuple[str | None, str | None]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, str(exc)
+    _, body = parse_frontmatter(text)
+    return source_body_hash(body), None
+
+
 def normalize_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item) for item in value if str(item)]
@@ -163,6 +186,26 @@ def page_headings(body: str) -> list[str]:
 
 def tokenize(text: str) -> list[str]:
     return [token.lower() for token in TOKEN_RE.findall(text)]
+
+
+def is_external_target(value: str) -> bool:
+    return bool(URL_RE.match(value.strip()))
+
+
+def is_local_reference(value: str) -> bool:
+    value = value.strip()
+    if not value or is_external_target(value) or value.startswith("#"):
+        return False
+    return value.startswith(("raw/", "wiki/", "reports/")) or "/" in value or Path(value).suffix != ""
+
+
+def wiki_link_targets(body: str) -> list[str]:
+    targets: list[str] = []
+    for match in WIKI_LINK_RE.finditer(body):
+        target = match.group(1).split("|", 1)[0].split("#", 1)[0].strip()
+        if target:
+            targets.append(target)
+    return targets
 
 
 def extract_links(body: str, page_path: Path, root: Path) -> list[dict[str, str]]:
@@ -277,6 +320,48 @@ def build_memory_artifacts(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     return index, graph
 
 
+def canonical_artifact(data: Any) -> Any:
+    if isinstance(data, dict):
+        return {key: canonical_artifact(value) for key, value in sorted(data.items()) if key != "generated_at"}
+    if isinstance(data, list):
+        return [canonical_artifact(item) for item in data]
+    return data
+
+
+def artifact_matches(current: Any, expected: Any) -> bool:
+    return stable_json(canonical_artifact(current)) == stable_json(canonical_artifact(expected))
+
+
+def page_lookup(pages: list[dict[str, Any]]) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for page in pages:
+        path = str(page.get("path", ""))
+        if not path:
+            continue
+        keys = {
+            path,
+            Path(path).stem,
+            str(page.get("slug", "")),
+            str(page.get("title", "")),
+        }
+        for alias in normalize_list(page.get("aliases")):
+            keys.add(alias)
+        for key in keys:
+            normalized = key.strip().lower()
+            if normalized:
+                lookup[normalized] = path
+                lookup[slugify(normalized)] = path
+    return lookup
+
+
+def resolve_wiki_link(target: str, pages: list[dict[str, Any]]) -> str | None:
+    lookup = page_lookup(pages)
+    normalized = target.strip().lower()
+    if not normalized:
+        return None
+    return lookup.get(normalized) or lookup.get(slugify(normalized))
+
+
 def load_memory_index(root: Path) -> dict[str, Any]:
     data, error = load_json(root / "memory-index.json", {"pages": []})
     if error or not isinstance(data, dict) or not isinstance(data.get("pages"), list):
@@ -319,6 +404,11 @@ def retrieve(root: Path, query: str, limit: int = 5, expand_links: bool = True) 
         headings = [item.lower() for item in normalize_list(page.get("headings"))]
         summary = str(page.get("summary", "")).lower()
         search_text = str(page.get("search_text", "")).lower()
+        title_tokens = set(tokenize(title))
+        heading_tokens = set(token for heading in headings for token in tokenize(heading))
+        summary_tokens = set(tokenize(summary))
+        alias_tokens = set(token for alias in aliases for token in tokenize(alias))
+        search_counts = Counter(tokenize(search_text))
         score = 0.0
 
         if query.strip().lower() in {title, slug, *aliases}:
@@ -331,22 +421,22 @@ def retrieve(root: Path, query: str, limit: int = 5, expand_links: bool = True) 
             if term == slug:
                 score += 12
                 reasons[page_path]["slug"] += 1
-            if term in title:
+            if term in title_tokens:
                 score += 10
                 reasons[page_path]["title"] += 1
-            if term in aliases:
+            if term in aliases or term in alias_tokens:
                 score += 9
                 reasons[page_path]["alias"] += 1
             if term in tags:
                 score += 8
                 reasons[page_path]["tag"] += 1
-            if any(term in heading for heading in headings):
+            if term in heading_tokens:
                 score += 5
                 reasons[page_path]["heading"] += 1
-            if term in summary:
+            if term in summary_tokens:
                 score += 4
                 reasons[page_path]["summary"] += 1
-            occurrences = search_text.count(term)
+            occurrences = search_counts.get(term, 0)
             if occurrences:
                 score += min(occurrences, 8) * 0.75
                 reasons[page_path]["lexical"] += occurrences

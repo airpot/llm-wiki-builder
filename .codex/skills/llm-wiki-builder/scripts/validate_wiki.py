@@ -6,8 +6,11 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
+
+sys.dont_write_bytecode = True
 
 from wiki_lib import (
     CONFIDENCE_VALUES,
@@ -15,7 +18,11 @@ from wiki_lib import (
     REQUIRED_DIRS,
     REQUIRED_FILES,
     REQUIRED_FRONTMATTER,
+    artifact_matches,
     build_memory_artifacts,
+    file_body_hash,
+    is_external_target,
+    is_local_reference,
     iter_wiki_pages,
     load_json,
     normalize_list,
@@ -61,9 +68,46 @@ def validate_page(path: Path, root: Path) -> tuple[list[str], list[str]]:
         if list_field in metadata and not isinstance(metadata[list_field], list):
             warnings.append(f"{page}: {list_field} should be a list")
 
+    for source in normalize_list(metadata.get("sources")):
+        if is_local_reference(source) and not (root / source).exists():
+            warnings.append(f"{page}: source path does not exist: {source}")
+
     for raw_target, resolved in local_markdown_targets(body, path, root):
         if not resolved.exists():
             warnings.append(f"{page}: broken local markdown link {raw_target}")
+    return errors, warnings
+
+
+def iter_raw_source_files(root: Path) -> list[Path]:
+    raw = root / "raw"
+    if not raw.exists():
+        return []
+    return sorted(path for path in raw.rglob("*.md") if path.is_file())
+
+
+def validate_source_provenance(root: Path) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    for path in iter_raw_source_files(root):
+        rel = relpath(path, root)
+        text = path.read_text(encoding="utf-8")
+        metadata, _ = parse_frontmatter(text)
+        source_path = metadata.get("source_path")
+        if isinstance(source_path, str) and source_path and not is_external_target(source_path):
+            candidate = root / source_path
+            if not candidate.exists():
+                warnings.append(f"{rel}: source_path does not exist: {source_path}")
+        expected_hash = metadata.get("sha256") or metadata.get("source_hash")
+        if expected_hash in (None, ""):
+            continue
+        if not isinstance(expected_hash, str):
+            warnings.append(f"{rel}: source hash should be a string")
+            continue
+        actual_hash, hash_error = file_body_hash(path)
+        if hash_error:
+            errors.append(f"{rel}: cannot compute source hash: {hash_error}")
+        elif actual_hash != expected_hash:
+            warnings.append(f"{rel}: source hash mismatch")
     return errors, warnings
 
 
@@ -129,10 +173,14 @@ def validate_json_artifacts(root: Path) -> tuple[list[str], list[str]]:
         expected_paths = sorted(page.get("path") for page in expected_index.get("pages", []))
         if current_paths != expected_paths:
             warnings.append("memory-index.json page set is stale; run build_memory_index.py --write")
+        elif not artifact_matches(memory_index, expected_index):
+            warnings.append("memory-index.json content is stale; run build_memory_index.py --write")
         current_nodes = sorted(link_graph.get("nodes", []))
         expected_nodes = sorted(expected_graph.get("nodes", []))
         if current_nodes != expected_nodes:
             warnings.append("link-graph.json nodes are stale; run build_memory_index.py --write")
+        elif not artifact_matches(link_graph, expected_graph):
+            warnings.append("link-graph.json content is stale; run build_memory_index.py --write")
     return errors, warnings
 
 
@@ -163,8 +211,9 @@ def validate_wiki(root: Path) -> dict[str, Any]:
     json_errors, json_warnings = validate_json_artifacts(root)
     eval_errors, eval_warnings = validate_eval_cases(root)
     query_errors, query_warnings = validate_query_log(root)
-    errors.extend(json_errors + eval_errors + query_errors)
-    warnings.extend(json_warnings + eval_warnings + query_warnings)
+    provenance_errors, provenance_warnings = validate_source_provenance(root)
+    errors.extend(json_errors + eval_errors + query_errors + provenance_errors)
+    warnings.extend(json_warnings + eval_warnings + query_warnings + provenance_warnings)
 
     return {
         "root": root.as_posix(),
