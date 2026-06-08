@@ -1,12 +1,15 @@
 # Lint And Optimization
 
-The optimization loop improves wiki structure and retrieval quality without unsafe silent content rewrites.
+The optimization loop improves wiki structure and retrieval quality without unsafe silent content rewrites. In the current skill, validation, health checks, memory index rebuilds, retrieval, and retrieval evals are deterministic scripts; safe fixes and optimization planning are agent-mediated workflows unless a dedicated script is explicitly added.
 
 ## Validation Checks
 
 Validate:
 
 - required baseline files and directories;
+- complete Wiki Core Direction in `SCHEMA.md`, warning by default and failing in strict mode;
+- extraction profile JSON shape and duplicate profile ids;
+- profile references on compiled pages;
 - compiled page frontmatter fields and allowed values;
 - JSON shape for `memory-index.json` and `link-graph.json`;
 - JSONL shape for `query-log.jsonl` and `retrieval-evals.jsonl`;
@@ -14,13 +17,13 @@ Validate:
 - index coverage for compiled pages;
 - memory index and link graph freshness, including content drift after page edits;
 - local source path existence and optional raw body hash provenance;
-- retrieval eval schema.
+- retrieval eval schema, including optional `profile_id`.
 
-Run `scripts/health_check.py` for zero-LLM structural preflight. It reports empty/stub pages, broken Markdown links, broken wikilinks, orphan pages, index completeness, log coverage, tag taxonomy drift, and page size warnings without applying fixes.
+Run `scripts/health_check.py` for zero-LLM structural preflight. It reports empty/stub pages, broken Markdown links, broken wikilinks, orphan pages, index completeness, log coverage, tag taxonomy drift, page size warnings, unprofiled pages, profiles with no pages, profiles with no eval cases, missing profile-required sections, and profile-specific query misses without applying fixes.
 
-## Safe-Fix Mode
+## Agent-Mediated Safe-Fix Mode
 
-Safe-fix mode may repair only deterministic issues:
+Safe-fix mode is not a standalone auto-fix CLI. When the user explicitly requests safe fixes, the agent may use deterministic script output and apply only repairs whose target and replacement can be derived without semantic judgment:
 
 - missing generated directories or baseline empty files;
 - stale memory index and link graph;
@@ -29,7 +32,7 @@ Safe-fix mode may repair only deterministic issues:
 - mechanical frontmatter defaults;
 - log formatting drift.
 
-Safe-fix mode must not rewrite raw source body text, merge pages, split pages, delete pages, or substantially reorganize page content.
+Safe-fix mode must not rewrite raw source body text, merge pages, split pages, delete pages, or substantially reorganize page content. If a deterministic script is not available for a proposed repair, treat the change as an agent-mediated edit and report exactly what will change before writing.
 
 ## Suggestion-Only Optimization
 
@@ -43,11 +46,14 @@ Report, but do not apply, semantic changes such as:
 - frequent query misses;
 - low-confidence pages;
 - unresolved contested pages.
+- profile coverage gaps;
+- profile-specific query misses;
+- profile-required section gaps.
 
-Write optimization reports under `reports/optimization/` and append `log.md`.
+Write optimization reports under `reports/optimization/` and append `log.md`. Applying semantic optimization requires explicit user approval or explicit write-mode execution for an accepted plan.
 
 ## Retrieval Benchmarks
 
-`retrieval-evals.jsonl` cases require `id`, `query`, and `expected_pages`. Optional fields: `forbidden_pages`, `tags`, `notes`.
+`retrieval-evals.jsonl` cases require `id`, `query`, and `expected_pages`. Optional fields: `profile_id`, `forbidden_pages`, `tags`, `notes`.
 
 `scripts/evaluate_retrieval.py` reports hit rate plus `recall_at_k`, `precision_at_k`, `mrr_at_k`, and `ndcg_at_k`. When optimization changes retrieval-relevant files, rerun the benchmark or state why it could not run, then compare before/after metrics in the report.

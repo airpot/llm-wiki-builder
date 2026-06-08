@@ -20,12 +20,16 @@ from wiki_lib import (
     REQUIRED_FRONTMATTER,
     artifact_matches,
     build_memory_artifacts,
+    core_direction_complete,
     file_body_hash,
     is_external_target,
     is_local_reference,
+    is_profile_enabled,
     iter_wiki_pages,
+    load_profiles,
     load_json,
     normalize_list,
+    page_headings,
     parse_frontmatter,
     read_jsonl,
     relpath,
@@ -43,7 +47,25 @@ def local_markdown_targets(body: str, page_path: Path, root: Path) -> list[tuple
     return targets
 
 
-def validate_page(path: Path, root: Path) -> tuple[list[str], list[str]]:
+def required_sections_for_page(metadata: dict[str, Any], profiles: dict[str, dict[str, Any]]) -> set[str]:
+    sections: set[str] = set()
+    page_type = str(metadata.get("type") or "")
+    for profile_id in normalize_list(metadata.get("profiles")):
+        profile = profiles.get(profile_id)
+        if not profile:
+            continue
+        required = profile.get("required_sections_by_type")
+        if isinstance(required, dict):
+            sections.update(normalize_list(required.get(page_type)))
+    return sections
+
+
+def validate_page(
+    path: Path,
+    root: Path,
+    profiles: dict[str, dict[str, Any]],
+    profile_enabled: bool,
+) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
     text = path.read_text(encoding="utf-8")
@@ -67,6 +89,15 @@ def validate_page(path: Path, root: Path) -> tuple[list[str], list[str]]:
     for list_field in ("aliases", "tags", "sources"):
         if list_field in metadata and not isinstance(metadata[list_field], list):
             warnings.append(f"{page}: {list_field} should be a list")
+    if "profiles" in metadata and not isinstance(metadata["profiles"], list):
+        errors.append(f"{page}: profiles must be a list")
+    page_profiles = normalize_list(metadata.get("profiles"))
+    if page_profiles:
+        for profile_id in page_profiles:
+            if profile_id not in profiles:
+                warnings.append(f"{page}: unknown profile reference: {profile_id}")
+    elif profile_enabled:
+        warnings.append(f"{page}: page is unprofiled in a profile-enabled wiki")
 
     for source in normalize_list(metadata.get("sources")):
         if is_local_reference(source) and not (root / source).exists():
@@ -75,6 +106,11 @@ def validate_page(path: Path, root: Path) -> tuple[list[str], list[str]]:
     for raw_target, resolved in local_markdown_targets(body, path, root):
         if not resolved.exists():
             warnings.append(f"{page}: broken local markdown link {raw_target}")
+
+    headings = {heading.strip().lower() for heading in page_headings(body)}
+    for required_section in sorted(required_sections_for_page(metadata, profiles)):
+        if required_section.strip().lower() not in headings:
+            warnings.append(f"{page}: missing required profile section: {required_section}")
     return errors, warnings
 
 
@@ -97,21 +133,30 @@ def validate_source_provenance(root: Path) -> tuple[list[str], list[str]]:
             candidate = root / source_path
             if not candidate.exists():
                 warnings.append(f"{rel}: source_path does not exist: {source_path}")
-        expected_hash = metadata.get("sha256") or metadata.get("source_hash")
-        if expected_hash in (None, ""):
+        expected_hashes: dict[str, str] = {}
+        for hash_field in ("sha256", "source_hash"):
+            expected_hash = metadata.get(hash_field)
+            if expected_hash in (None, ""):
+                continue
+            if not isinstance(expected_hash, str):
+                warnings.append(f"{rel}: {hash_field} should be a string")
+                continue
+            expected_hashes[hash_field] = expected_hash
+        if not expected_hashes:
             continue
-        if not isinstance(expected_hash, str):
-            warnings.append(f"{rel}: source hash should be a string")
-            continue
+        if len(set(expected_hashes.values())) > 1:
+            warnings.append(f"{rel}: sha256 and source_hash disagree")
         actual_hash, hash_error = file_body_hash(path)
         if hash_error:
             errors.append(f"{rel}: cannot compute source hash: {hash_error}")
-        elif actual_hash != expected_hash:
-            warnings.append(f"{rel}: source hash mismatch")
+        else:
+            for hash_field, expected_hash in expected_hashes.items():
+                if actual_hash != expected_hash:
+                    warnings.append(f"{rel}: {hash_field} mismatch")
     return errors, warnings
 
 
-def validate_eval_cases(root: Path) -> tuple[list[str], list[str]]:
+def validate_eval_cases(root: Path, profiles: dict[str, dict[str, Any]]) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
     cases, jsonl_errors = read_jsonl(root / "retrieval-evals.jsonl")
@@ -132,13 +177,18 @@ def validate_eval_cases(root: Path) -> tuple[list[str], list[str]]:
             errors.append(f"retrieval-evals.jsonl {label}: query is required")
         if not isinstance(expected, list) or not expected:
             errors.append(f"retrieval-evals.jsonl {label}: expected_pages must be a non-empty list")
+        profile_id = case.get("profile_id")
+        if profile_id is not None and (not isinstance(profile_id, str) or not profile_id):
+            warnings.append(f"retrieval-evals.jsonl {label}: profile_id should be a non-empty string")
+        elif profile_id and profile_id not in profiles:
+            warnings.append(f"retrieval-evals.jsonl {label}: unknown profile_id: {profile_id}")
         for optional in ("forbidden_pages", "tags"):
             if optional in case and not isinstance(case[optional], list):
                 warnings.append(f"retrieval-evals.jsonl {label}: {optional} should be a list")
     return errors, warnings
 
 
-def validate_query_log(root: Path) -> tuple[list[str], list[str]]:
+def validate_query_log(root: Path, profiles: dict[str, dict[str, Any]]) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
     entries, jsonl_errors = read_jsonl(root / "query-log.jsonl")
@@ -151,6 +201,22 @@ def validate_query_log(root: Path) -> tuple[list[str], list[str]]:
             errors.append(f"query-log.jsonl line {index}: selected_pages must be a list")
         if "miss" in entry and not isinstance(entry["miss"], bool):
             errors.append(f"query-log.jsonl line {index}: miss must be boolean")
+        profile_id = entry.get("profile_id")
+        if profile_id is not None and (not isinstance(profile_id, str) or not profile_id):
+            warnings.append(f"query-log.jsonl line {index}: profile_id should be a non-empty string")
+        elif profile_id and profile_id not in profiles:
+            warnings.append(f"query-log.jsonl line {index}: unknown profile_id: {profile_id}")
+    return errors, warnings
+
+
+def validate_profile_state(root: Path, profiles: dict[str, dict[str, Any]], profile_errors: list[str]) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    errors.extend(profile_errors)
+    if not (root / "profiles").exists():
+        warnings.append("profiles/ is missing; normal profile-enabled wikis should include profiles/")
+    if not core_direction_complete(root):
+        warnings.append("SCHEMA.md lacks a complete Wiki Core Direction")
     return errors, warnings
 
 
@@ -187,6 +253,8 @@ def validate_json_artifacts(root: Path) -> tuple[list[str], list[str]]:
 def validate_wiki(root: Path) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
+    profiles, profile_errors = load_profiles(root)
+    profile_enabled = is_profile_enabled(root)
 
     for rel in REQUIRED_FILES:
         if not (root / rel).exists():
@@ -197,7 +265,7 @@ def validate_wiki(root: Path) -> dict[str, Any]:
 
     page_paths = iter_wiki_pages(root)
     for page in page_paths:
-        page_errors, page_warnings = validate_page(page, root)
+        page_errors, page_warnings = validate_page(page, root, profiles, profile_enabled)
         errors.extend(page_errors)
         warnings.extend(page_warnings)
 
@@ -209,15 +277,18 @@ def validate_wiki(root: Path) -> dict[str, Any]:
                 warnings.append(f"index.md does not mention {page_rel}")
 
     json_errors, json_warnings = validate_json_artifacts(root)
-    eval_errors, eval_warnings = validate_eval_cases(root)
-    query_errors, query_warnings = validate_query_log(root)
+    profile_state_errors, profile_state_warnings = validate_profile_state(root, profiles, profile_errors)
+    eval_errors, eval_warnings = validate_eval_cases(root, profiles)
+    query_errors, query_warnings = validate_query_log(root, profiles)
     provenance_errors, provenance_warnings = validate_source_provenance(root)
-    errors.extend(json_errors + eval_errors + query_errors + provenance_errors)
-    warnings.extend(json_warnings + eval_warnings + query_warnings + provenance_warnings)
+    errors.extend(json_errors + profile_state_errors + eval_errors + query_errors + provenance_errors)
+    warnings.extend(json_warnings + profile_state_warnings + eval_warnings + query_warnings + provenance_warnings)
 
     return {
         "root": root.as_posix(),
         "pages": len(page_paths),
+        "profiles": sorted(profiles),
+        "profile_enabled": profile_enabled,
         "errors": errors,
         "warnings": warnings,
         "status": "fail" if errors else "pass",

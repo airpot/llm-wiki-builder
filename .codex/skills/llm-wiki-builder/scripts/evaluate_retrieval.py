@@ -12,7 +12,7 @@ from typing import Any
 
 sys.dont_write_bytecode = True
 
-from wiki_lib import page_matches_identifier, read_jsonl, retrieve, write_report
+from wiki_lib import load_profiles, page_matches_identifier, read_jsonl, retrieve, write_report
 
 
 def first_matching_rank(hits: list[dict[str, Any]], identifier: str) -> int | None:
@@ -27,7 +27,8 @@ def discounted_gain(rank: int) -> float:
 
 
 def evaluate_case(root: Path, case: dict[str, Any], limit: int) -> dict[str, Any]:
-    hits = retrieve(root, case["query"], limit=limit, expand_links=True)
+    profile_id = case.get("profile_id")
+    hits = retrieve(root, case["query"], limit=limit, expand_links=True, profile=profile_id)
     expected_pages = [str(item) for item in case.get("expected_pages", [])]
     forbidden_pages = [str(item) for item in case.get("forbidden_pages", [])]
     matched_expected: list[str] = []
@@ -62,6 +63,7 @@ def evaluate_case(root: Path, case: dict[str, Any], limit: int) -> dict[str, Any
     return {
         "id": case["id"],
         "query": case["query"],
+        "profile_id": profile_id,
         "passed": passed,
         "hits": hits,
         "expected_pages": expected_pages,
@@ -101,11 +103,20 @@ def main() -> int:
 
     invalid: list[str] = []
     valid_cases: list[dict[str, Any]] = []
+    profiles, profile_errors = load_profiles(root)
+    if profile_errors:
+        for error in profile_errors:
+            print(f"error: {error}")
+        return 1
     for index, case in enumerate(cases, start=1):
         if not isinstance(case.get("id"), str) or not isinstance(case.get("query"), str) or not isinstance(case.get("expected_pages"), list):
             invalid.append(f"case {index}: requires id, query, and expected_pages")
         elif not case["expected_pages"]:
             invalid.append(f"case {case['id']}: expected_pages must not be empty")
+        elif "profile_id" in case and (not isinstance(case.get("profile_id"), str) or not case.get("profile_id")):
+            invalid.append(f"case {case['id']}: profile_id must be a non-empty string when present")
+        elif case.get("profile_id") and case.get("profile_id") not in profiles:
+            invalid.append(f"case {case['id']}: unknown profile_id {case.get('profile_id')}")
         else:
             valid_cases.append(case)
     if invalid:
@@ -124,6 +135,7 @@ def main() -> int:
         "cases": total,
         "passed": passed,
         "hit_rate": hit_rate,
+        "profiles": sorted({str(result.get("profile_id")) for result in results if result.get("profile_id")}),
         "metrics": {
             "recall_at_k": average_metric(results, "recall_at_k"),
             "precision_at_k": average_metric(results, "precision_at_k"),
@@ -145,6 +157,7 @@ def main() -> int:
             f"- Cases: {total}",
             f"- Passed: {passed}",
             f"- Hit rate: {hit_rate:.3f}",
+            f"- Profiles: {', '.join(report['profiles']) if report['profiles'] else 'none'}",
             f"- Recall@{args.limit}: {report['metrics']['recall_at_k']:.3f}",
             f"- Precision@{args.limit}: {report['metrics']['precision_at_k']:.3f}",
             f"- MRR@{args.limit}: {report['metrics']['mrr_at_k']:.3f}",

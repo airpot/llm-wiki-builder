@@ -11,13 +11,22 @@ Created: {{created}}
 - `link-graph.json`
 - `query-log.jsonl`
 - `retrieval-evals.jsonl`
+- `profiles/`
 - `raw/`
 - `wiki/`
 - `reports/`
 
+## Wiki Core Direction
+
+{{core_direction}}
+
+Normal initialization records the confirmed wiki purpose here. Draft initialization marks this section incomplete; complete it before relying on strict validation or profile-aware ingest.
+
 ## Page Frontmatter
 
 Required fields: `title`, `slug`, `created`, `updated`, `type`, `summary`, `aliases`, `tags`, `sources`, `confidence`, `contested`.
+
+Profile-aware pages may also include optional `profiles` and `extraction_goal` fields.
 
 Allowed page types: `concept`, `entity`, `comparison`, `query`, `note`, `source-summary`.
 
@@ -26,3 +35,7 @@ Allowed confidence values: `high`, `medium`, `low`, `unknown`.
 ## Raw Source Policy
 
 Raw notes preserve source meaning. Do not silently rewrite source claims, replace prior raw notes, or delete raw source body text.
+
+## Extraction Profiles
+
+Profiles live under `profiles/*.json` and use schema `llm-wiki-extraction-profile-v1`. A profile controls what to extract, what to ignore, page types, granularity, evidence policy, conflict policy, output roots, required sections, and retrieval/eval expectations.

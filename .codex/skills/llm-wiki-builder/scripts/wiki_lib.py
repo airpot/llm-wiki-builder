@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import sys
+import unicodedata
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +41,61 @@ REQUIRED_DIRS = [
     "reports/retrieval",
 ]
 
+PROFILE_DIR = "profiles"
+PROFILE_SCHEMA = "llm-wiki-extraction-profile-v1"
+CORE_DIRECTION_FIELDS = [
+    "purpose",
+    "primary_users",
+    "core_knowledge_targets",
+    "out_of_scope",
+    "landing_granularity",
+    "evidence_policy",
+    "conflict_policy",
+    "success_queries",
+]
+CORE_DIRECTION_LABELS = {
+    "purpose": "Purpose",
+    "primary_users": "Primary Users",
+    "core_knowledge_targets": "Core Knowledge Targets",
+    "out_of_scope": "Out Of Scope",
+    "landing_granularity": "Landing Granularity",
+    "evidence_policy": "Evidence Policy",
+    "conflict_policy": "Conflict Policy",
+    "success_queries": "Success Queries",
+}
+PROFILE_REQUIRED_FIELDS = [
+    "schema",
+    "profile_id",
+    "purpose",
+    "target_audience",
+    "extract_dimensions",
+    "exclude_dimensions",
+    "page_types",
+    "granularity",
+    "evidence_policy",
+    "conflict_policy",
+    "output_roots",
+]
+PROFILE_LIST_FIELDS = {
+    "target_audience",
+    "extract_dimensions",
+    "exclude_dimensions",
+    "page_types",
+    "output_roots",
+}
+PLACEHOLDER_VALUES = {
+    "",
+    "...",
+    "fill in",
+    "n/a",
+    "placeholder",
+    "tbd",
+    "to be decided",
+    "to be filled",
+    "todo",
+    "unspecified",
+}
+
 REQUIRED_FRONTMATTER = [
     "title",
     "slug",
@@ -63,6 +119,21 @@ HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
 MARKDOWN_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
 WIKI_LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 URL_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
+PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+CJK_RANGES = (
+    (0x3040, 0x30FF),
+    (0x3400, 0x4DBF),
+    (0x4E00, 0x9FFF),
+    (0xAC00, 0xD7AF),
+    (0xF900, 0xFAFF),
+    (0x20000, 0x2A6DF),
+    (0x2A700, 0x2B73F),
+    (0x2B740, 0x2B81F),
+    (0x2B820, 0x2CEAF),
+    (0x2CEB0, 0x2EBEF),
+    (0x30000, 0x3134F),
+    (0x31350, 0x323AF),
+)
 
 
 def utc_now() -> str:
@@ -173,6 +244,188 @@ def normalize_list(value: Any) -> list[str]:
     return [str(value)]
 
 
+def is_placeholder_value(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in PLACEHOLDER_VALUES
+    if isinstance(value, list):
+        return not value or any(is_placeholder_value(item) for item in value)
+    return value in (None, "")
+
+
+def safe_profile_id(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def profile_filename(profile_id: str) -> str:
+    return f"{profile_id}.json"
+
+
+def validate_core_direction_data(data: Any) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(data, dict):
+        return ["core direction must be a JSON object"]
+    for field in CORE_DIRECTION_FIELDS:
+        value = data.get(field)
+        if field in {"purpose", "landing_granularity", "evidence_policy", "conflict_policy"}:
+            if not isinstance(value, str) or is_placeholder_value(value):
+                errors.append(f"core direction {field} must be a non-empty string")
+        else:
+            if not isinstance(value, list) or is_placeholder_value(value):
+                errors.append(f"core direction {field} must be a non-empty list")
+    return errors
+
+
+def render_core_direction(data: dict[str, Any] | None, draft: bool = False) -> str:
+    if draft or not data:
+        return "\n".join(
+            [
+                "Status:",
+                "- draft",
+                "",
+                "Purpose:",
+                "- unspecified",
+                "",
+                "Primary Users:",
+                "- unspecified",
+                "",
+                "Core Knowledge Targets:",
+                "- unspecified",
+                "",
+                "Out Of Scope:",
+                "- unspecified",
+                "",
+                "Landing Granularity:",
+                "- unspecified",
+                "",
+                "Evidence Policy:",
+                "- unspecified",
+                "",
+                "Conflict Policy:",
+                "- unspecified",
+                "",
+                "Success Queries:",
+                "- unspecified",
+            ]
+        )
+
+    lines: list[str] = []
+    for field in CORE_DIRECTION_FIELDS:
+        if lines:
+            lines.append("")
+        lines.append(f"{CORE_DIRECTION_LABELS[field]}:")
+        value = data.get(field)
+        items = normalize_list(value)
+        for item in items:
+            lines.append(f"- {item}")
+    return "\n".join(lines)
+
+
+def extract_markdown_section(text: str, heading: str) -> str:
+    pattern = re.compile(rf"^##\s+{re.escape(heading)}\s*$", flags=re.MULTILINE)
+    match = pattern.search(text)
+    if not match:
+        return ""
+    tail = text[match.end() :]
+    next_section = re.search(r"^##\s+", tail, flags=re.MULTILINE)
+    return tail[: next_section.start()] if next_section else tail
+
+
+def core_direction_complete(root: Path) -> bool:
+    schema = root / "SCHEMA.md"
+    if not schema.exists():
+        return False
+    section = extract_markdown_section(schema.read_text(encoding="utf-8"), "Wiki Core Direction")
+    if not section.strip():
+        return False
+    lowered = section.lower()
+    if "status:" in lowered and "draft" in lowered:
+        return False
+    required_labels = [CORE_DIRECTION_LABELS[field] + ":" for field in CORE_DIRECTION_FIELDS]
+    for label in required_labels:
+        label_match = re.search(rf"^{re.escape(label)}\s*$", section, flags=re.MULTILINE)
+        if not label_match:
+            return False
+        tail = section[label_match.end() :]
+        next_label = re.search(r"^[A-Z][A-Za-z ]+:\s*$", tail, flags=re.MULTILINE)
+        block = tail[: next_label.start()] if next_label else tail
+        bullets = [line.strip()[1:].strip() for line in block.splitlines() if line.strip().startswith("-")]
+        if not bullets or any(is_placeholder_value(item) or item.lower() == "unspecified" for item in bullets):
+            return False
+    return True
+
+
+def iter_profile_files(root: Path) -> list[Path]:
+    profiles = root / PROFILE_DIR
+    if not profiles.exists():
+        return []
+    return sorted(path for path in profiles.glob("*.json") if path.is_file())
+
+
+def validate_profile_data(data: Any) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(data, dict):
+        return ["profile must be a JSON object"]
+    for field in PROFILE_REQUIRED_FIELDS:
+        if field not in data:
+            errors.append(f"missing required profile field {field}")
+            continue
+        value = data.get(field)
+        if field in PROFILE_LIST_FIELDS:
+            if not isinstance(value, list) or is_placeholder_value(value):
+                errors.append(f"profile field {field} must be a non-empty list")
+        elif not isinstance(value, str) or is_placeholder_value(value):
+            errors.append(f"profile field {field} must be a non-empty string")
+    if data.get("schema") and data.get("schema") != PROFILE_SCHEMA:
+        errors.append(f"profile schema must be {PROFILE_SCHEMA}")
+    profile_id = safe_profile_id(data.get("profile_id"))
+    if profile_id and not PROFILE_ID_RE.match(profile_id):
+        errors.append("profile_id must use letters, numbers, underscores, or hyphens and start with a letter or number")
+    for page_type in normalize_list(data.get("page_types")):
+        if page_type not in PAGE_TYPES:
+            errors.append(f"invalid profile page type {page_type!r}")
+    for output_root in normalize_list(data.get("output_roots")):
+        candidate = Path(output_root)
+        if candidate.is_absolute() or ".." in candidate.parts or output_root == "wiki" or not output_root.startswith("wiki/"):
+            errors.append(f"output root must stay under wiki/: {output_root}")
+    sections = data.get("required_sections_by_type")
+    if sections is not None:
+        if not isinstance(sections, dict):
+            errors.append("required_sections_by_type must be an object when present")
+        else:
+            for page_type, section_names in sections.items():
+                if page_type not in PAGE_TYPES:
+                    errors.append(f"required_sections_by_type has invalid page type {page_type!r}")
+                if not isinstance(section_names, list):
+                    errors.append(f"required_sections_by_type[{page_type}] must be a list")
+    return errors
+
+
+def load_profiles(root: Path) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    profiles: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    for path in iter_profile_files(root):
+        rel = relpath(path, root)
+        data, error = load_json(path, {})
+        if error:
+            errors.append(f"{rel}: invalid JSON: {error}")
+            continue
+        profile_errors = validate_profile_data(data)
+        if profile_errors:
+            errors.extend(f"{rel}: {item}" for item in profile_errors)
+            continue
+        profile_id = safe_profile_id(data.get("profile_id"))
+        if profile_id in profiles:
+            errors.append(f"{rel}: duplicate profile_id {profile_id}")
+            continue
+        profiles[profile_id] = data
+    return profiles, errors
+
+
+def is_profile_enabled(root: Path) -> bool:
+    profiles, _ = load_profiles(root)
+    return bool(profiles) or core_direction_complete(root)
+
+
 def iter_wiki_pages(root: Path) -> list[Path]:
     wiki = root / "wiki"
     if not wiki.exists():
@@ -184,8 +437,50 @@ def page_headings(body: str) -> list[str]:
     return [match.group(2).strip() for match in HEADING_RE.finditer(body)]
 
 
+def is_cjk_char(value: str) -> bool:
+    codepoint = ord(value)
+    return any(start <= codepoint <= end for start, end in CJK_RANGES)
+
+
+def is_word_char(value: str) -> bool:
+    return value == "_" or unicodedata.category(value)[0] in {"L", "N"}
+
+
+def cjk_tokens(run: str) -> list[str]:
+    run = run.lower()
+    if len(run) <= 1:
+        return [run] if run else []
+    return [run[index : index + 2] for index in range(len(run) - 1)]
+
+
 def tokenize(text: str) -> list[str]:
-    return [token.lower() for token in TOKEN_RE.findall(text)]
+    tokens: list[str] = []
+    word_run: list[str] = []
+    cjk_run: list[str] = []
+
+    def flush_word() -> None:
+        if word_run:
+            tokens.append("".join(word_run).lower())
+            word_run.clear()
+
+    def flush_cjk() -> None:
+        if cjk_run:
+            tokens.extend(cjk_tokens("".join(cjk_run)))
+            cjk_run.clear()
+
+    for char in text:
+        if is_cjk_char(char):
+            flush_word()
+            cjk_run.append(char)
+        elif is_word_char(char):
+            flush_cjk()
+            word_run.append(char)
+        else:
+            flush_word()
+            flush_cjk()
+    flush_word()
+    flush_cjk()
+    return tokens
 
 
 def is_external_target(value: str) -> bool:
@@ -221,7 +516,9 @@ def extract_links(body: str, page_path: Path, root: Path) -> list[dict[str, str]
             target_rel = target
         links.append({"target": target_rel, "kind": "markdown"})
     for match in WIKI_LINK_RE.finditer(body):
-        links.append({"target": slugify(match.group(1).split("|", 1)[0]), "kind": "wiki"})
+        target = match.group(1).split("|", 1)[0].split("#", 1)[0].strip()
+        if target:
+            links.append({"target": target, "kind": "wiki"})
     return links
 
 
@@ -235,6 +532,7 @@ def page_record(path: Path, root: Path) -> dict[str, Any]:
     aliases = normalize_list(metadata.get("aliases"))
     tags = normalize_list(metadata.get("tags"))
     sources = normalize_list(metadata.get("sources"))
+    profiles = normalize_list(metadata.get("profiles"))
     summary = str(metadata.get("summary") or "")
     search_parts = [title, slug, summary, " ".join(aliases), " ".join(tags), " ".join(headings), body]
     links = extract_links(body, path, root)
@@ -247,6 +545,8 @@ def page_record(path: Path, root: Path) -> dict[str, Any]:
         "aliases": aliases,
         "tags": tags,
         "sources": sources,
+        "profiles": profiles,
+        "extraction_goal": str(metadata.get("extraction_goal") or ""),
         "confidence": str(metadata.get("confidence") or "unknown"),
         "contested": bool(metadata.get("contested", False)),
         "created": str(metadata.get("created") or ""),
@@ -266,14 +566,16 @@ def build_memory_artifacts(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     path_set = {page["path"] for page in pages}
     outgoing: dict[str, list[str]] = {}
     incoming: dict[str, list[str]] = {page["path"]: [] for page in pages}
-    slug_to_path = {page["slug"]: page["path"] for page in pages}
+    link_lookup = page_lookup(pages)
 
     for page in pages:
         page_links: list[str] = []
         for link in page["links"]:
             target = link["target"]
-            if target in slug_to_path:
-                target = slug_to_path[target]
+            if link["kind"] == "wiki":
+                resolved_target = link_lookup.get(target.strip().lower()) or link_lookup.get(slugify(target))
+                if resolved_target:
+                    target = resolved_target
             if target in path_set:
                 page_links.append(target)
                 incoming.setdefault(target, []).append(page["path"])
@@ -292,6 +594,8 @@ def build_memory_artifacts(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                     "aliases",
                     "tags",
                     "sources",
+                    "profiles",
+                    "extraction_goal",
                     "confidence",
                     "contested",
                     "created",
@@ -362,14 +666,46 @@ def resolve_wiki_link(target: str, pages: list[dict[str, Any]]) -> str | None:
     return lookup.get(normalized) or lookup.get(slugify(normalized))
 
 
+def is_memory_index(data: Any) -> bool:
+    return isinstance(data, dict) and isinstance(data.get("pages"), list)
+
+
+def is_link_graph(data: Any) -> bool:
+    return isinstance(data, dict) and isinstance(data.get("links"), list)
+
+
+def load_retrieval_artifacts(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    expected_index, expected_graph = build_memory_artifacts(root)
+
+    memory_index, memory_error = load_json(root / "memory-index.json", {})
+    if memory_error or not is_memory_index(memory_index) or not artifact_matches(memory_index, expected_index):
+        memory_index = expected_index
+
+    link_graph, graph_error = load_json(root / "link-graph.json", {})
+    if graph_error or not is_link_graph(link_graph) or not artifact_matches(link_graph, expected_graph):
+        link_graph = expected_graph
+
+    return memory_index, link_graph
+
+
 def load_memory_index(root: Path) -> dict[str, Any]:
+    data, _ = load_retrieval_artifacts(root)
+    return data
+
+
+def load_link_graph(root: Path) -> dict[str, Any]:
+    _, data = load_retrieval_artifacts(root)
+    return data
+
+
+def load_memory_index_legacy(root: Path) -> dict[str, Any]:
     data, error = load_json(root / "memory-index.json", {"pages": []})
     if error or not isinstance(data, dict) or not isinstance(data.get("pages"), list):
         data, _ = build_memory_artifacts(root)
     return data
 
 
-def load_link_graph(root: Path) -> dict[str, Any]:
+def load_link_graph_legacy(root: Path) -> dict[str, Any]:
     data, error = load_json(root / "link-graph.json", {"links": [], "outgoing": {}, "incoming": {}})
     if error or not isinstance(data, dict):
         _, data = build_memory_artifacts(root)
@@ -385,14 +721,41 @@ def page_matches_identifier(page: dict[str, Any], identifier: str) -> bool:
     }
 
 
-def retrieve(root: Path, query: str, limit: int = 5, expand_links: bool = True) -> list[dict[str, Any]]:
-    memory_index = load_memory_index(root)
+def page_profile_eligible(page: dict[str, Any], profile: str | None, include_unprofiled: bool) -> bool:
+    if not profile:
+        return True
+    page_profiles = normalize_list(page.get("profiles"))
+    if profile in page_profiles:
+        return True
+    return include_unprofiled and not page_profiles
+
+
+def retrieve(
+    root: Path,
+    query: str,
+    limit: int = 5,
+    expand_links: bool = True,
+    profile: str | None = None,
+    include_unprofiled: bool = False,
+) -> list[dict[str, Any]]:
+    if profile:
+        profiles, profile_errors = load_profiles(root)
+        if profile_errors:
+            raise ValueError("; ".join(profile_errors))
+        if profile not in profiles:
+            raise ValueError(f"unknown profile: {profile}")
+    memory_index, graph = load_retrieval_artifacts(root)
     pages = memory_index.get("pages", [])
     query_terms = tokenize(query)
     query_text = " ".join(query_terms)
+    query_raw = query.strip().lower()
     scores: dict[str, float] = {}
     reasons: dict[str, Counter[str]] = {}
-    by_path = {page["path"]: page for page in pages if isinstance(page, dict) and "path" in page}
+    by_path = {
+        page["path"]: page
+        for page in pages
+        if isinstance(page, dict) and "path" in page and page_profile_eligible(page, profile, include_unprofiled)
+    }
 
     for page in by_path.values():
         page_path = page["path"]
@@ -408,13 +771,14 @@ def retrieve(root: Path, query: str, limit: int = 5, expand_links: bool = True) 
         heading_tokens = set(token for heading in headings for token in tokenize(heading))
         summary_tokens = set(tokenize(summary))
         alias_tokens = set(token for alias in aliases for token in tokenize(alias))
+        tag_tokens = set(token for tag in tags for token in tokenize(tag))
         search_counts = Counter(tokenize(search_text))
         score = 0.0
 
         if query.strip().lower() in {title, slug, *aliases}:
             score += 60
             reasons[page_path]["exact"] += 1
-        if query_text and query_text in summary:
+        if (query_text and query_text in summary) or (query_raw and query_raw in summary):
             score += 20
             reasons[page_path]["summary_phrase"] += 1
         for term in query_terms:
@@ -427,7 +791,7 @@ def retrieve(root: Path, query: str, limit: int = 5, expand_links: bool = True) 
             if term in aliases or term in alias_tokens:
                 score += 9
                 reasons[page_path]["alias"] += 1
-            if term in tags:
+            if term in tags or term in tag_tokens:
                 score += 8
                 reasons[page_path]["tag"] += 1
             if term in heading_tokens:
@@ -442,12 +806,18 @@ def retrieve(root: Path, query: str, limit: int = 5, expand_links: bool = True) 
                 reasons[page_path]["lexical"] += occurrences
         matched_score = score
         if matched_score > 0:
+            page_profiles = normalize_list(page.get("profiles"))
+            if profile and profile in page_profiles:
+                score += 3
+                reasons[page_path]["profile"] += 1
+            elif profile and not page_profiles and include_unprofiled:
+                score = max(score - 1, 0.1)
+                reasons[page_path]["unprofiled"] += 1
             if page.get("updated"):
                 score += 0.1
             scores[page_path] = score
 
     if expand_links and scores:
-        graph = load_link_graph(root)
         outgoing = graph.get("outgoing", {}) if isinstance(graph.get("outgoing"), dict) else {}
         incoming = graph.get("incoming", {}) if isinstance(graph.get("incoming"), dict) else {}
         seed_paths = sorted(scores, key=lambda path: scores[path], reverse=True)[: max(limit, 3)]
@@ -468,6 +838,7 @@ def retrieve(root: Path, query: str, limit: int = 5, expand_links: bool = True) 
                 "slug": page.get("slug", ""),
                 "score": round(scores[path], 3),
                 "summary": page.get("summary", ""),
+                "profiles": normalize_list(page.get("profiles")),
                 "confidence": page.get("confidence", "unknown"),
                 "contested": bool(page.get("contested", False)),
                 "reasons": sorted(reasons.get(path, Counter()).keys()),
@@ -497,13 +868,19 @@ def read_jsonl(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
 
 
 def write_report(root: Path, kind: str, name: str, markdown: str, data: dict[str, Any] | None = None) -> tuple[Path, Path | None]:
-    timestamp = utc_now().replace(":", "").replace("-", "")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     report_dir = root / "reports" / kind
     report_dir.mkdir(parents=True, exist_ok=True)
-    md_path = report_dir / f"{timestamp}-{slugify(name)}.md"
+    base_stem = f"{timestamp}-{slugify(name)}"
+    stem = base_stem
+    suffix = 1
+    while (report_dir / f"{stem}.md").exists() or (data is not None and (report_dir / f"{stem}.json").exists()):
+        suffix += 1
+        stem = f"{base_stem}-{suffix}"
+    md_path = report_dir / f"{stem}.md"
     md_path.write_text(markdown.rstrip() + "\n", encoding="utf-8")
     json_path = None
     if data is not None:
-        json_path = report_dir / f"{timestamp}-{slugify(name)}.json"
+        json_path = report_dir / f"{stem}.json"
         write_json(json_path, data)
     return md_path, json_path

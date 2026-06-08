@@ -16,8 +16,11 @@ from wiki_lib import (
     MARKDOWN_LINK_RE,
     build_memory_artifacts,
     iter_wiki_pages,
+    load_profiles,
     normalize_list,
+    page_headings,
     parse_frontmatter,
+    read_jsonl,
     relpath,
     resolve_wiki_link,
     tokenize,
@@ -80,14 +83,38 @@ def check_health(root: Path) -> dict[str, Any]:
     pages = [path for path in iter_wiki_pages(root)]
     memory_index, link_graph = build_memory_artifacts(root)
     index_pages = [page for page in memory_index.get("pages", []) if isinstance(page, dict)]
+    profiles, profile_errors = load_profiles(root)
+    profile_page_counts = {profile_id: 0 for profile_id in profiles}
+    eval_profile_counts = {profile_id: 0 for profile_id in profiles}
     tags_allowed = taxonomy_tags(root)
     index_text = (root / "index.md").read_text(encoding="utf-8") if (root / "index.md").exists() else ""
     log_text = (root / "log.md").read_text(encoding="utf-8") if (root / "log.md").exists() else ""
+
+    for error in profile_errors:
+        findings.append(finding("error", "profile-validation", "profiles/", error))
 
     for page_path in pages:
         page_rel = relpath(page_path, root)
         text = page_path.read_text(encoding="utf-8")
         metadata, body = parse_frontmatter(text)
+        page_profiles = normalize_list(metadata.get("profiles"))
+        if profiles and not page_profiles:
+            findings.append(finding("warning", "profile-coverage", page_rel, "page has no profiles"))
+        for profile_id in page_profiles:
+            if profile_id in profile_page_counts:
+                profile_page_counts[profile_id] += 1
+
+        headings = {heading.strip().lower() for heading in page_headings(body)}
+        for profile_id in page_profiles:
+            profile = profiles.get(profile_id)
+            required = profile.get("required_sections_by_type") if profile else None
+            if isinstance(required, dict):
+                for section in normalize_list(required.get(str(metadata.get("type") or ""))):
+                    if section.strip().lower() not in headings:
+                        findings.append(
+                            finding("warning", "profile-required-section", page_rel, f"missing section: {section}")
+                        )
+
         body_chars = len(body.strip())
         if body_chars < STUB_BODY_CHARS:
             findings.append(finding("warning", "stub-page", page_rel, "page body is shorter than 100 characters"))
@@ -121,6 +148,37 @@ def check_health(root: Path) -> dict[str, Any]:
         if len(index_pages) > 1:
             findings.append(finding("warning", "orphan-page", str(orphan), "page has no incoming or outgoing wiki links"))
 
+    eval_cases, eval_errors = read_jsonl(root / "retrieval-evals.jsonl")
+    for error in eval_errors:
+        findings.append(finding("error", "retrieval-eval-jsonl", "retrieval-evals.jsonl", error))
+    for case in eval_cases:
+        profile_id = case.get("profile_id")
+        if profile_id in eval_profile_counts:
+            eval_profile_counts[profile_id] += 1
+
+    query_entries, query_errors = read_jsonl(root / "query-log.jsonl")
+    for error in query_errors:
+        findings.append(finding("error", "query-log-jsonl", "query-log.jsonl", error))
+    profile_misses: dict[str, int] = {profile_id: 0 for profile_id in profiles}
+    for entry in query_entries:
+        profile_id = entry.get("profile_id")
+        if profile_id in profile_misses and entry.get("miss") is True:
+            profile_misses[profile_id] += 1
+
+    for profile_id, count in profile_page_counts.items():
+        if count == 0:
+            findings.append(finding("warning", "profile-coverage", f"profiles/{profile_id}.json", "profile has no pages"))
+    for profile_id, count in eval_profile_counts.items():
+        if count == 0:
+            findings.append(
+                finding("info", "profile-eval-coverage", f"profiles/{profile_id}.json", "profile has no eval cases")
+            )
+    for profile_id, count in profile_misses.items():
+        if count:
+            findings.append(
+                finding("warning", "profile-query-miss", f"profiles/{profile_id}.json", f"profile has {count} query misses")
+            )
+
     counts: dict[str, int] = {"error": 0, "warning": 0, "info": 0}
     for item in findings:
         counts[item["severity"]] = counts.get(item["severity"], 0) + 1
@@ -130,6 +188,7 @@ def check_health(root: Path) -> dict[str, Any]:
         "root": root.as_posix(),
         "status": status,
         "pages": len(pages),
+        "profiles": sorted(profiles),
         "findings": findings,
         "counts": counts,
     }

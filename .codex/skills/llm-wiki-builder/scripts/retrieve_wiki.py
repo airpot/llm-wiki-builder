@@ -20,6 +20,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=5, help="Maximum number of hits to return")
     parser.add_argument("--no-expand", action="store_true", help="Disable one-hop link expansion")
     parser.add_argument("--no-log", action="store_true", help="Disable query-log.jsonl writes")
+    parser.add_argument("--profile", help="Filter retrieval to pages declaring this extraction profile")
+    parser.add_argument(
+        "--include-unprofiled",
+        action="store_true",
+        help="Include unprofiled pages during profile-filtered retrieval, ranked below profile matches",
+    )
     parser.add_argument("--json", action="store_true", help="Print JSON result")
     return parser
 
@@ -27,7 +33,18 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     root = Path(args.wiki_root)
-    hits = retrieve(root, args.query, limit=args.limit, expand_links=not args.no_expand)
+    try:
+        hits = retrieve(
+            root,
+            args.query,
+            limit=args.limit,
+            expand_links=not args.no_expand,
+            profile=args.profile,
+            include_unprofiled=args.include_unprofiled,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     miss = not hits
     log_path = root / "query-log.jsonl"
     if log_path.exists() and not args.no_log:
@@ -41,6 +58,7 @@ def main() -> int:
                 "retrieval_mode": RETRIEVAL_MODE,
                 "limit": args.limit,
                 "scores": {hit["path"]: hit["score"] for hit in hits},
+                **({"profile_id": args.profile} if args.profile else {}),
             },
         )
 
@@ -48,6 +66,8 @@ def main() -> int:
         "query": args.query,
         "miss": miss,
         "retrieval_mode": RETRIEVAL_MODE,
+        "profile_id": args.profile,
+        "include_unprofiled": args.include_unprofiled,
         "hits": hits,
     }
     if args.json:
@@ -59,7 +79,8 @@ def main() -> int:
         print("Suggested next step: ingest source material or create a compiled wiki page.")
         return 0
 
-    print(f"query: {args.query}")
+    profile_suffix = f" profile={args.profile}" if args.profile else ""
+    print(f"query: {args.query}{profile_suffix}")
     for index, hit in enumerate(hits, start=1):
         flags: list[str] = []
         if hit.get("confidence") in {"low", "unknown"}:
