@@ -45,23 +45,23 @@ An LLM wiki is a user-owned directory, not this repository. The default structur
    - Benchmark retrieval with `scripts/evaluate_retrieval.py`.
 6. When compiling or editing pages, keep raw source notes under `raw/` source-preserving and write profile-aware compiled pages under `wiki/`.
 7. When multiple profiles exist, select an active profile before semantic ingest. Do not update an incompatible-profile page just because title, slug, alias, or tag matches.
-8. After retrieval-relevant edits, rebuild `memory-index.json` and `link-graph.json`, append `log.md`, and run retrieval evals when cases exist.
+8. After retrieval-relevant edits, rebuild `memory-index.json` and `link-graph.json`, append `log.md`, and run retrieval evals when cases exist. When mixed-language misses recur, prefer explicit page aliases or wiki-owned glossary entries over implicit translation.
 9. Report changed wiki files, validation results, retrieval metrics, active profiles, and any low-confidence or contested areas.
 
 ## Resources
 
-- `references/wiki-protocol.md`: runtime structure, Wiki Core Direction, extraction profiles, frontmatter fields, page types, indexes, raw source policy, and logs.
+- `references/wiki-protocol.md`: runtime structure, Wiki Core Direction, extraction profiles, glossary files, frontmatter fields, page types, indexes, raw source policy, and logs.
 - `references/ingest-workflow.md`: source classification, active profile selection, raw note creation, compiled page updates, and cascade updates.
-- `references/retrieval-workflow.md`: deterministic ranking, profile filtering, one-hop expansion, citations, and query-log schema.
-- `references/lint-and-optimization.md`: validation, profile coverage, agent-mediated safe-fix/write-mode boundaries, reports, and retrieval evals.
+- `references/retrieval-workflow.md`: deterministic ranking, Retrieval Contract, bilingual alias/glossary expansion, profile filtering, seed-vs-context expansion, citations, and query-log schema.
+- `references/lint-and-optimization.md`: validation, glossary coverage, profile coverage, agent-mediated safe-fix/write-mode boundaries, reports, negative evals, and retrieval evals.
 - `references/conflict-handling.md`: source attribution, contradictions, contested pages, and confidence rules.
 - `references/external-patterns.md`: concise ecosystem patterns and isolation notes.
 - `scripts/init_wiki.py`: create missing wiki structure, Wiki Core Direction, and profiles without overwriting user files; use `--draft` only for explicit underspecified initialization.
-- `scripts/validate_wiki.py`: validate wiki structure, profile files, frontmatter, links, JSON/JSONL files, generated artifact freshness, and source provenance.
+- `scripts/validate_wiki.py`: validate wiki structure, profile files, glossary files, frontmatter, links, JSON/JSONL files, generated artifact freshness, and source provenance.
 - `scripts/health_check.py`: run zero-LLM structural health checks for stubs, links, orphans, index coverage, log coverage, tags, page size, and profile coverage.
 - `scripts/build_memory_index.py`: rebuild `memory-index.json` and `link-graph.json` from `wiki/`.
 - `scripts/retrieve_wiki.py`: retrieve pages with deterministic lexical ranking and optional query logging.
-- `scripts/evaluate_retrieval.py`: run `retrieval-evals.jsonl` cases and write ranking-aware retrieval reports.
+- `scripts/evaluate_retrieval.py`: run positive and expected-miss `retrieval-evals.jsonl` cases and write ranking-aware retrieval reports.
 - `assets/templates/`: baseline output templates used by scripts and agent workflows.
 
 ## Guardrails

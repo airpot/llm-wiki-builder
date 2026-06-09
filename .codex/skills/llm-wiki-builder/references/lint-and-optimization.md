@@ -9,6 +9,8 @@ Validate:
 - required baseline files and directories;
 - complete Wiki Core Direction in `SCHEMA.md`, warning by default and failing in strict mode;
 - extraction profile JSON shape and duplicate profile ids;
+- optional profile retrieval gates;
+- optional `glossary.json` and `glossary.jsonl` shape and conflicts;
 - profile references on compiled pages;
 - compiled page frontmatter fields and allowed values;
 - JSON shape for `memory-index.json` and `link-graph.json`;
@@ -17,9 +19,9 @@ Validate:
 - index coverage for compiled pages;
 - memory index and link graph freshness, including content drift after page edits;
 - local source path existence and optional raw body hash provenance;
-- retrieval eval schema, including optional `profile_id`.
+- retrieval eval schema, including optional `profile_id`, `expect_miss`, `require_seed_hit`, `allow_forbidden_context`, and `min_score`.
 
-Run `scripts/health_check.py` for zero-LLM structural preflight. It reports empty/stub pages, broken Markdown links, broken wikilinks, orphan pages, index completeness, log coverage, tag taxonomy drift, page size warnings, unprofiled pages, profiles with no pages, profiles with no eval cases, missing profile-required sections, and profile-specific query misses without applying fixes.
+Run `scripts/health_check.py` for zero-LLM structural preflight. It reports empty/stub pages, broken Markdown links, broken wikilinks, orphan pages, index completeness, log coverage, tag taxonomy drift, page size warnings, unprofiled pages, profiles with no pages, profiles with no eval cases, missing profile-required sections, profile-specific query misses, glossary issues, and mixed-language eval coverage gaps without applying fixes.
 
 ## Agent-Mediated Safe-Fix Mode
 
@@ -42,6 +44,7 @@ Report, but do not apply, semantic changes such as:
 - overlong pages;
 - weak summaries;
 - missing aliases;
+- missing bilingual aliases or glossary mappings;
 - sparse link graph;
 - frequent query misses;
 - low-confidence pages;
@@ -54,6 +57,8 @@ Write optimization reports under `reports/optimization/` and append `log.md`. Ap
 
 ## Retrieval Benchmarks
 
-`retrieval-evals.jsonl` cases require `id`, `query`, and `expected_pages`. Optional fields: `profile_id`, `forbidden_pages`, `tags`, `notes`.
+Positive `retrieval-evals.jsonl` cases require `id`, `query`, and non-empty `expected_pages`. Expected-miss cases may use `expect_miss: true` and must omit `expected_pages` or set it to an empty list. Optional fields: `profile_id`, `forbidden_pages`, `tags`, `notes`, `min_score`, `require_seed_hit`, `allow_forbidden_context`.
 
-`scripts/evaluate_retrieval.py` reports hit rate plus `recall_at_k`, `precision_at_k`, `mrr_at_k`, and `ndcg_at_k`. When optimization changes retrieval-relevant files, rerun the benchmark or state why it could not run, then compare before/after metrics in the report.
+`scripts/evaluate_retrieval.py` reports positive-case hit rate, expected-miss accuracy, `recall_at_k`, `precision_at_k`, `mrr_at_k`, `ndcg_at_k`, and profile retrieval gate failures. When a profile declares `retrieval.min_seed_score`, `retrieval.min_recall_at_k`, or `retrieval.min_mrr_at_k`, benchmark execution fails if the declared gate fails. When optimization changes retrieval-relevant files, rerun the benchmark or state why it could not run, then compare before/after metrics in the report.
+
+Use `require_seed_hit` when an expected page must be a primary match rather than a one-hop context page. Use `allow_forbidden_context` only when a forbidden page is unacceptable as a seed hit but acceptable as adjacent context.

@@ -13,6 +13,8 @@
   link-graph.json
   query-log.jsonl
   retrieval-evals.jsonl
+  glossary.json
+  glossary.jsonl
   profiles/
     core.json
   raw/
@@ -32,7 +34,7 @@
     retrieval/
 ```
 
-Create missing files and directories without overwriting existing user files. `profiles/` stores extraction profile JSON. `raw/` stores source-preserving notes. `wiki/` stores agent-maintained compiled pages. `reports/` stores local validation, optimization, and retrieval evidence.
+Create missing files and directories without overwriting existing user files. `profiles/` stores extraction profile JSON. Optional `glossary.json` or `glossary.jsonl` stores explicit multilingual retrieval term mappings. `raw/` stores source-preserving notes. `wiki/` stores agent-maintained compiled pages. `reports/` stores local validation, optimization, and retrieval evidence.
 
 ## Wiki Core Direction
 
@@ -66,6 +68,21 @@ Profiles are standard JSON files under `profiles/*.json` using `schema: llm-wiki
 - `output_roots`
 
 Optional fields include `name`, `required_sections_by_type`, and `eval_queries`. `profile_id` must be stable because pages, retrieval evals, and query logs refer to it.
+
+Profiles may also include optional retrieval gates:
+
+```json
+{
+  "retrieval": {
+    "min_seed_score": 1,
+    "min_recall_at_k": 0.8,
+    "min_mrr_at_k": 0.7,
+    "allow_glossary_expansion": true
+  }
+}
+```
+
+`allow_glossary_expansion: false` disables glossary-expanded matches for profile-filtered retrieval while leaving direct title, slug, exact page path, path stem, alias, tag, heading, summary, and body lexical matches available. `min_seed_score`, `min_recall_at_k`, and `min_mrr_at_k` are surfaced as retrieval benchmark gate failures.
 
 A wiki is profile-enabled when it has at least one valid profile or a complete Wiki Core Direction. Legacy wikis have neither. Default validation treats legacy profile gaps as warnings at most; strict validation enforces profile completeness for profile-enabled wikis.
 
@@ -127,4 +144,23 @@ If the user explicitly requests raw note deletion, archival, or replacement, rec
 
 `query-log.jsonl` entries should include timestamp, query text, selected page identifiers, miss status, and retrieval mode. Profile-filtered retrieval also records `profile_id`.
 
-`retrieval-evals.jsonl` cases require `id`, `query`, and `expected_pages`; optional fields are `profile_id`, `forbidden_pages`, `tags`, and `notes`. Retrieval reports include hit rate plus ranking-aware metrics: `recall_at_k`, `precision_at_k`, `mrr_at_k`, and `ndcg_at_k`.
+`retrieval-evals.jsonl` positive cases require `id`, `query`, and `expected_pages`; optional fields are `profile_id`, `forbidden_pages`, `tags`, `notes`, `min_score`, `require_seed_hit`, and `allow_forbidden_context`. Expected-miss cases may set `expect_miss: true` and must omit or leave `expected_pages` empty. Retrieval reports include hit rate for positive cases, miss accuracy for expected-miss cases, ranking-aware metrics, and profile gate failures: `recall_at_k`, `precision_at_k`, `mrr_at_k`, and `ndcg_at_k`.
+
+## Glossary
+
+`glossary.json` may define:
+
+```json
+{
+  "schema": "llm-wiki-glossary-v1",
+  "terms": [
+    {
+      "canonical": "retrieval",
+      "aliases": ["retrieval", "检索", "召回"],
+      "notes": "Retrieval-stage terminology."
+    }
+  ]
+}
+```
+
+`glossary.jsonl` may contain one term object per line. Glossary entries are retrieval aids only; they do not establish source truth. Validation reports malformed entries, duplicate canonical terms, conflicting alias mappings, placeholder values, and non-string aliases.

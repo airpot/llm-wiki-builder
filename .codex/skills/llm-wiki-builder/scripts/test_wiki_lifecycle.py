@@ -190,6 +190,64 @@ contested: false
     )
 
 
+def write_retrieval_contract_page(root: Path) -> None:
+    page = root / "wiki" / "concepts" / "retrieval-contract.md"
+    page.write_text(
+        """---
+title: Retrieval Contract
+slug: retrieval-contract
+created: 2026-06-09
+updated: 2026-06-09
+type: concept
+summary: Retrieval contract defines seed hits and context expansion.
+aliases: [命中契约]
+tags: [retrieval]
+sources: [raw/articles/transformer-memory-source.md]
+profiles: [core]
+extraction_goal: retrieval contract coverage
+confidence: medium
+contested: false
+---
+
+# Retrieval Contract
+
+A retrieval contract defines seed hits, expected misses, and context expansion.
+
+## Links
+
+- [[Context Expansion]]
+""",
+        encoding="utf-8",
+    )
+
+
+def write_context_expansion_page(root: Path) -> None:
+    page = root / "wiki" / "concepts" / "context-expansion.md"
+    page.write_text(
+        """---
+title: Context Expansion
+slug: context-expansion
+created: 2026-06-09
+updated: 2026-06-09
+type: concept
+summary: Adjacent pages support retrieval answers.
+aliases: []
+tags: [retrieval]
+sources: [raw/articles/transformer-memory-source.md]
+profiles: [core]
+extraction_goal: retrieval context coverage
+confidence: medium
+contested: false
+---
+
+# Context Expansion
+
+Adjacent pages support retrieval answers after a primary match has occurred.
+""",
+        encoding="utf-8",
+    )
+
+
 def prepare_wiki(root: Path) -> None:
     init_profile_wiki(root)
     write_raw_source(root)
@@ -211,6 +269,8 @@ def prepare_wiki(root: Path) -> None:
     )
     write_alias_page(root)
     write_cjk_page(root)
+    write_retrieval_contract_page(root)
+    write_context_expansion_page(root)
     write_page(
         root,
         "wiki/concepts/memory-playbook.md",
@@ -230,6 +290,8 @@ def prepare_wiki(root: Path) -> None:
 - wiki/concepts/memory-index.md - Memory index.
 - wiki/concepts/alias-target.md - Alias target.
 - wiki/concepts/cjk-memory.md - 中文记忆索引.
+- wiki/concepts/retrieval-contract.md - Retrieval contract.
+- wiki/concepts/context-expansion.md - Context expansion.
 - wiki/concepts/memory-playbook.md - Memory playbook.
 """,
         encoding="utf-8",
@@ -250,14 +312,74 @@ def prepare_wiki(root: Path) -> None:
     write_json(root / "memory-index.json", memory_index)
     write_json(root / "link-graph.json", link_graph)
     (root / "retrieval-evals.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "id": "transformer-memory",
+                        "query": "transformer memory retrieval",
+                        "expected_pages": ["wiki/concepts/transformer-memory.md"],
+                        "forbidden_pages": ["wiki/concepts/not-present.md"],
+                        "profile_id": "core",
+                        "require_seed_hit": True,
+                    },
+                    sort_keys=True,
+                ),
+                json.dumps(
+                    {
+                        "id": "mixed-language-retrieval-contract",
+                        "query": "检索 contract 怎么设计",
+                        "expected_pages": ["wiki/concepts/retrieval-contract.md"],
+                        "profile_id": "core",
+                        "require_seed_hit": True,
+                        "min_score": 5,
+                        "tags": ["mixed-language"],
+                    },
+                    sort_keys=True,
+                ),
+                json.dumps(
+                    {
+                        "id": "negative-unrelated-zh",
+                        "query": "火星土豆烹饪",
+                        "expect_miss": True,
+                        "forbidden_pages": ["wiki/concepts/retrieval-contract.md"],
+                    },
+                    sort_keys=True,
+                ),
+                json.dumps(
+                    {
+                        "id": "context-only-rejected",
+                        "query": "seed expected misses",
+                        "expected_pages": ["wiki/concepts/context-expansion.md"],
+                        "require_seed_hit": True,
+                    },
+                    sort_keys=True,
+                ),
+                json.dumps(
+                    {
+                        "id": "forbidden-context-allowed",
+                        "query": "seed expected misses",
+                        "expected_pages": ["wiki/concepts/retrieval-contract.md"],
+                        "forbidden_pages": ["wiki/concepts/context-expansion.md"],
+                        "allow_forbidden_context": True,
+                    },
+                    sort_keys=True,
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (root / "glossary.json").write_text(
         json.dumps(
             {
-                "id": "transformer-memory",
-                "query": "transformer memory retrieval",
-                "expected_pages": ["wiki/concepts/transformer-memory.md"],
-                "forbidden_pages": ["wiki/concepts/not-present.md"],
-                "profile_id": "core",
+                "schema": "llm-wiki-glossary-v1",
+                "terms": [
+                    {"canonical": "retrieval", "aliases": ["retrieval", "检索", "召回"]},
+                    {"canonical": "contract", "aliases": ["contract", "契约"]},
+                ],
             },
+            ensure_ascii=False,
             sort_keys=True,
         )
         + "\n",
@@ -423,6 +545,47 @@ def main() -> int:
             print({"tokens": tokenize("注意力记忆 上下文检索"), "hits": cjk_hits})
             return 1
 
+        mixed_hits = retrieve(root, "检索 contract 怎么设计", limit=5, profile="core")
+        if not mixed_hits or mixed_hits[0]["path"] != "wiki/concepts/retrieval-contract.md":
+            print("error: mixed-language retrieval did not rank expected page first")
+            print(mixed_hits)
+            return 1
+        if mixed_hits[0].get("match_type") != "seed" or "glossary" not in mixed_hits[0].get("reasons", []):
+            print("error: mixed-language retrieval did not expose seed/glossary evidence")
+            print(mixed_hits)
+            return 1
+        playbook_mixed_hits = retrieve(root, "检索 contract", limit=5, profile="playbook")
+        if any(hit["path"] == "wiki/concepts/retrieval-contract.md" for hit in playbook_mixed_hits):
+            print("error: glossary expansion bypassed profile filtering")
+            print(playbook_mixed_hits)
+            return 1
+        context_hits = retrieve(root, "seed expected misses", limit=5, profile="core")
+        context_match = [hit for hit in context_hits if hit["path"] == "wiki/concepts/context-expansion.md"]
+        if not context_match or context_match[0].get("match_type") != "context":
+            print("error: one-hop context expansion was not marked as context")
+            print(context_hits)
+            return 1
+
+        eval_result = run_command([sys.executable, str(SCRIPT_DIR / "evaluate_retrieval.py"), str(root), "--json"])
+        if eval_result.returncode == 0:
+            print("error: retrieval eval unexpectedly passed with context-only expected page")
+            print(eval_result.stdout)
+            print(eval_result.stderr)
+            return 1
+        eval_json = json.loads(eval_result.stdout)
+        if "context-only-rejected" not in eval_json.get("context_only_expected", {}):
+            print("error: retrieval eval did not report context-only expected failure")
+            print(eval_result.stdout)
+            return 1
+        if eval_json.get("expected_miss_failures"):
+            print("error: negative retrieval eval unexpectedly failed")
+            print(eval_result.stdout)
+            return 1
+        passing_eval_text = "\n".join(
+            line for line in (root / "retrieval-evals.jsonl").read_text(encoding="utf-8").splitlines()
+            if "context-only-rejected" not in line
+        )
+        (root / "retrieval-evals.jsonl").write_text(passing_eval_text + "\n", encoding="utf-8")
         eval_result = run_command([sys.executable, str(SCRIPT_DIR / "evaluate_retrieval.py"), str(root), "--json"])
         if eval_result.returncode != 0:
             print(eval_result.stdout)
@@ -434,11 +597,53 @@ def main() -> int:
             print("error: retrieval metrics did not meet lifecycle expectations")
             print(eval_result.stdout)
             return 1
+        if eval_json.get("negative_cases") != 1 or eval_json.get("miss_accuracy") != 1.0:
+            print("error: negative retrieval metrics did not meet lifecycle expectations")
+            print(eval_result.stdout)
+            return 1
+
+        min_score_case = {
+            "id": "min-score-failure",
+            "query": "检索 contract 怎么设计",
+            "expected_pages": ["wiki/concepts/retrieval-contract.md"],
+            "min_score": 1000,
+        }
+        (root / "retrieval-evals.jsonl").write_text(
+            (root / "retrieval-evals.jsonl").read_text(encoding="utf-8") + json.dumps(min_score_case, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        min_score_result = run_command([sys.executable, str(SCRIPT_DIR / "evaluate_retrieval.py"), str(root), "--json"])
+        if min_score_result.returncode == 0 or "min-score-failure" not in min_score_result.stdout:
+            print("error: min_score failure was not enforced")
+            print(min_score_result.stdout)
+            return 1
+        prepare_wiki(root)
 
         health = check_health(root)
         if health["status"] != "pass":
             print(json.dumps(health, indent=2, ensure_ascii=False))
             return 1
+        if any(item["check"] == "mixed-language-eval-coverage" for item in health["findings"]):
+            print("error: health check reported mixed-language eval gap despite mixed-language eval case")
+            print(json.dumps(health, indent=2, ensure_ascii=False))
+            return 1
+        eval_text = (root / "retrieval-evals.jsonl").read_text(encoding="utf-8")
+        (root / "retrieval-evals.jsonl").write_text("", encoding="utf-8")
+        health_missing_eval = check_health(root)
+        (root / "retrieval-evals.jsonl").write_text(eval_text, encoding="utf-8")
+        if not any(item["check"] == "mixed-language-eval-coverage" for item in health_missing_eval["findings"]):
+            print("error: health check did not report glossary mixed-language eval coverage gap after eval reset")
+            print(json.dumps(health_missing_eval, indent=2, ensure_ascii=False))
+            return 1
+
+        bad_glossary = root / "glossary.jsonl"
+        bad_glossary.write_text(json.dumps({"canonical": "retrieval", "aliases": ["other"]}) + "\n", encoding="utf-8")
+        glossary_validation = validate_wiki(root)
+        if not any("duplicate canonical term" in warning for warning in glossary_validation["warnings"]):
+            print("error: duplicate glossary canonical warning was not detected")
+            print(json.dumps(glossary_validation, indent=2, ensure_ascii=False))
+            return 1
+        bad_glossary.unlink()
 
         stale_page = root / "wiki" / "concepts" / "transformer-memory.md"
         stale_page.write_text(stale_page.read_text(encoding="utf-8") + "\nAdditional retrieval-relevant text.\n", encoding="utf-8")
@@ -460,7 +665,7 @@ slug: new-topic
 created: 2026-06-06
 updated: 2026-06-06
 type: concept
-summary: Needle retrieval topic.
+summary: Zorbax needle topic.
 aliases: []
 tags: []
 sources: [raw/articles/transformer-memory-source.md]
@@ -472,11 +677,11 @@ contested: false
 
 # New Topic
 
-Needle retrieval topic.
+Zorbax needle topic.
 """,
             encoding="utf-8",
         )
-        stale_hits = retrieve(root, "needle retrieval", limit=5)
+        stale_hits = retrieve(root, "zorbax needle", limit=5)
         if not stale_hits or stale_hits[0]["path"] != "wiki/concepts/new-topic.md":
             print("error: stale generated artifacts caused a retrieval miss")
             print(stale_hits)

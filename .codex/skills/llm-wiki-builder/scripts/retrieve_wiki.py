@@ -48,16 +48,22 @@ def main() -> int:
     miss = not hits
     log_path = root / "query-log.jsonl"
     if log_path.exists() and not args.no_log:
+        seed_pages = [hit["path"] for hit in hits if hit.get("match_type") == "seed"]
+        context_pages = [hit["path"] for hit in hits if hit.get("match_type") == "context"]
         append_jsonl(
             log_path,
             {
                 "timestamp": utc_now(),
                 "query": args.query,
                 "selected_pages": [hit["path"] for hit in hits],
+                "seed_pages": seed_pages,
+                "context_pages": context_pages,
                 "miss": miss,
                 "retrieval_mode": RETRIEVAL_MODE,
                 "limit": args.limit,
                 "scores": {hit["path"]: hit["score"] for hit in hits},
+                "primary_scores": {hit["path"]: hit.get("primary_score", 0.0) for hit in hits},
+                "reason_counts": {hit["path"]: hit.get("reason_counts", {}) for hit in hits},
                 **({"profile_id": args.profile} if args.profile else {}),
             },
         )
@@ -83,6 +89,8 @@ def main() -> int:
     print(f"query: {args.query}{profile_suffix}")
     for index, hit in enumerate(hits, start=1):
         flags: list[str] = []
+        if hit.get("match_type") == "context":
+            flags.append("context=one-hop")
         if hit.get("confidence") in {"low", "unknown"}:
             flags.append(f"confidence={hit.get('confidence')}")
         if hit.get("contested"):

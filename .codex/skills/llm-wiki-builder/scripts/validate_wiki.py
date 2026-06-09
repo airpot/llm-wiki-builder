@@ -26,6 +26,8 @@ from wiki_lib import (
     is_local_reference,
     is_profile_enabled,
     iter_wiki_pages,
+    iter_glossary_entries,
+    load_glossary,
     load_profiles,
     load_json,
     normalize_list,
@@ -166,6 +168,7 @@ def validate_eval_cases(root: Path, profiles: dict[str, dict[str, Any]]) -> tupl
         case_id = case.get("id")
         query = case.get("query")
         expected = case.get("expected_pages")
+        expect_miss = case.get("expect_miss", False)
         label = case_id or f"line {index}"
         if not isinstance(case_id, str) or not case_id:
             errors.append(f"retrieval-evals.jsonl {label}: id is required")
@@ -175,7 +178,14 @@ def validate_eval_cases(root: Path, profiles: dict[str, dict[str, Any]]) -> tupl
             seen_ids.add(case_id)
         if not isinstance(query, str) or not query.strip():
             errors.append(f"retrieval-evals.jsonl {label}: query is required")
-        if not isinstance(expected, list) or not expected:
+        if "expect_miss" in case and not isinstance(expect_miss, bool):
+            errors.append(f"retrieval-evals.jsonl {label}: expect_miss must be boolean")
+        if expect_miss is True:
+            if expected is not None and not isinstance(expected, list):
+                errors.append(f"retrieval-evals.jsonl {label}: expected_pages must be a list when present")
+            elif expected:
+                errors.append(f"retrieval-evals.jsonl {label}: expected_pages must be omitted or empty when expect_miss is true")
+        elif not isinstance(expected, list) or not expected:
             errors.append(f"retrieval-evals.jsonl {label}: expected_pages must be a non-empty list")
         profile_id = case.get("profile_id")
         if profile_id is not None and (not isinstance(profile_id, str) or not profile_id):
@@ -185,6 +195,11 @@ def validate_eval_cases(root: Path, profiles: dict[str, dict[str, Any]]) -> tupl
         for optional in ("forbidden_pages", "tags"):
             if optional in case and not isinstance(case[optional], list):
                 warnings.append(f"retrieval-evals.jsonl {label}: {optional} should be a list")
+        for optional in ("require_seed_hit", "allow_forbidden_context"):
+            if optional in case and not isinstance(case[optional], bool):
+                errors.append(f"retrieval-evals.jsonl {label}: {optional} must be boolean")
+        if "min_score" in case and not isinstance(case["min_score"], (int, float)):
+            errors.append(f"retrieval-evals.jsonl {label}: min_score must be numeric")
     return errors, warnings
 
 
@@ -217,7 +232,36 @@ def validate_profile_state(root: Path, profiles: dict[str, dict[str, Any]], prof
         warnings.append("profiles/ is missing; normal profile-enabled wikis should include profiles/")
     if not core_direction_complete(root):
         warnings.append("SCHEMA.md lacks a complete Wiki Core Direction")
+    for profile_id, profile in profiles.items():
+        retrieval = profile.get("retrieval")
+        if retrieval is None:
+            continue
+        if not isinstance(retrieval, dict):
+            warnings.append(f"profiles/{profile_id}.json: retrieval must be an object when present")
+            continue
+        for field in ("min_seed_score", "min_recall_at_k", "min_mrr_at_k"):
+            if field in retrieval and not isinstance(retrieval[field], (int, float)):
+                warnings.append(f"profiles/{profile_id}.json: retrieval.{field} must be numeric")
+        if isinstance(retrieval.get("min_seed_score"), (int, float)) and float(retrieval["min_seed_score"]) < 0:
+            warnings.append(f"profiles/{profile_id}.json: retrieval.min_seed_score must be non-negative")
+        for field in ("min_recall_at_k", "min_mrr_at_k"):
+            if isinstance(retrieval.get(field), (int, float)) and not 0 <= float(retrieval[field]) <= 1:
+                warnings.append(f"profiles/{profile_id}.json: retrieval.{field} must be between 0 and 1")
+        if "allow_glossary_expansion" in retrieval and not isinstance(retrieval["allow_glossary_expansion"], bool):
+            warnings.append(f"profiles/{profile_id}.json: retrieval.allow_glossary_expansion must be boolean")
     return errors, warnings
+
+
+def validate_glossary(root: Path) -> tuple[list[str], list[str]]:
+    warnings: list[str] = []
+    _, entry_errors = iter_glossary_entries(root)
+    _, glossary_errors = load_glossary(root)
+    seen: set[str] = set()
+    for error in [*entry_errors, *glossary_errors]:
+        if error not in seen:
+            warnings.append(error)
+            seen.add(error)
+    return [], warnings
 
 
 def validate_json_artifacts(root: Path) -> tuple[list[str], list[str]]:
@@ -281,8 +325,16 @@ def validate_wiki(root: Path) -> dict[str, Any]:
     eval_errors, eval_warnings = validate_eval_cases(root, profiles)
     query_errors, query_warnings = validate_query_log(root, profiles)
     provenance_errors, provenance_warnings = validate_source_provenance(root)
-    errors.extend(json_errors + profile_state_errors + eval_errors + query_errors + provenance_errors)
-    warnings.extend(json_warnings + profile_state_warnings + eval_warnings + query_warnings + provenance_warnings)
+    glossary_errors, glossary_warnings = validate_glossary(root)
+    errors.extend(json_errors + profile_state_errors + eval_errors + query_errors + provenance_errors + glossary_errors)
+    warnings.extend(
+        json_warnings
+        + profile_state_warnings
+        + eval_warnings
+        + query_warnings
+        + provenance_warnings
+        + glossary_warnings
+    )
 
     return {
         "root": root.as_posix(),

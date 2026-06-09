@@ -43,6 +43,7 @@ REQUIRED_DIRS = [
 
 PROFILE_DIR = "profiles"
 PROFILE_SCHEMA = "llm-wiki-extraction-profile-v1"
+GLOSSARY_SCHEMA = "llm-wiki-glossary-v1"
 CORE_DIRECTION_FIELDS = [
     "purpose",
     "primary_users",
@@ -421,6 +422,131 @@ def load_profiles(root: Path) -> tuple[dict[str, dict[str, Any]], list[str]]:
     return profiles, errors
 
 
+def iter_glossary_entries(root: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    entries: list[dict[str, Any]] = []
+    errors: list[str] = []
+    json_path = root / "glossary.json"
+    if json_path.exists():
+        data, error = load_json(json_path, {})
+        if error:
+            errors.append(f"glossary.json: invalid JSON: {error}")
+        elif not isinstance(data, dict):
+            errors.append("glossary.json: glossary must be an object")
+        elif data.get("schema") not in (None, GLOSSARY_SCHEMA):
+            errors.append(f"glossary.json: schema must be {GLOSSARY_SCHEMA}")
+        else:
+            terms = data.get("terms", [])
+            if not isinstance(terms, list):
+                errors.append("glossary.json: terms must be a list")
+            else:
+                for index, term in enumerate(terms, start=1):
+                    if isinstance(term, dict):
+                        term = dict(term)
+                        term["_source"] = f"glossary.json terms[{index}]"
+                        entries.append(term)
+                    else:
+                        errors.append(f"glossary.json terms[{index}]: entry must be an object")
+
+    jsonl_path = root / "glossary.jsonl"
+    if jsonl_path.exists():
+        jsonl_entries, jsonl_errors = read_jsonl(jsonl_path)
+        errors.extend(error.replace(jsonl_path.as_posix(), "glossary.jsonl") for error in jsonl_errors)
+        for index, term in enumerate(jsonl_entries, start=1):
+            term = dict(term)
+            term["_source"] = f"glossary.jsonl line {index}"
+            entries.append(term)
+    return entries, errors
+
+
+def validate_glossary_entries(entries: list[dict[str, Any]]) -> list[str]:
+    errors: list[str] = []
+    seen_canonical: dict[str, str] = {}
+    seen_aliases: dict[str, str] = {}
+    for index, entry in enumerate(entries, start=1):
+        source = str(entry.get("_source") or f"glossary entry {index}")
+        canonical = str(entry.get("canonical") or "").strip()
+        if not canonical or is_placeholder_value(canonical):
+            errors.append(f"{source}: canonical must be a non-empty string")
+            continue
+        normalized_canonical = canonical.lower()
+        if normalized_canonical in seen_canonical:
+            errors.append(f"{source}: duplicate canonical term {canonical!r} also declared in {seen_canonical[normalized_canonical]}")
+        else:
+            seen_canonical[normalized_canonical] = source
+        aliases = entry.get("aliases")
+        if not isinstance(aliases, list) or is_placeholder_value(aliases):
+            errors.append(f"{source}: aliases must be a non-empty list")
+            continue
+        for alias in aliases:
+            if not isinstance(alias, str) or is_placeholder_value(alias):
+                errors.append(f"{source}: aliases must contain non-empty strings")
+                continue
+            normalized_alias = alias.strip().lower()
+            if normalized_alias in seen_aliases and seen_aliases[normalized_alias] != normalized_canonical:
+                errors.append(
+                    f"{source}: alias {alias!r} conflicts with canonical {seen_aliases[normalized_alias]!r}"
+                )
+            else:
+                seen_aliases[normalized_alias] = normalized_canonical
+    return errors
+
+
+def load_glossary(root: Path) -> tuple[dict[str, set[str]], list[str]]:
+    entries, errors = iter_glossary_entries(root)
+    errors.extend(validate_glossary_entries(entries))
+    groups: dict[str, set[str]] = {}
+    canonical_by_alias: dict[str, str] = {}
+    for entry in entries:
+        canonical = str(entry.get("canonical") or "").strip()
+        aliases = entry.get("aliases")
+        if not canonical or not isinstance(aliases, list):
+            continue
+        normalized_canonical = canonical.lower()
+        if normalized_canonical in groups:
+            continue
+        terms = {canonical}
+        valid = True
+        for alias in aliases:
+            if not isinstance(alias, str) or is_placeholder_value(alias):
+                valid = False
+                break
+            normalized_alias = alias.strip().lower()
+            if normalized_alias in canonical_by_alias and canonical_by_alias[normalized_alias] != normalized_canonical:
+                valid = False
+                break
+            canonical_by_alias[normalized_alias] = normalized_canonical
+            terms.add(alias)
+        if valid:
+            groups[normalized_canonical] = terms
+    return groups, errors
+
+
+def expanded_query_terms(query_terms: list[str], glossary: dict[str, set[str]]) -> tuple[list[str], list[str]]:
+    direct = list(dict.fromkeys(query_terms))
+    direct_set = set(direct)
+    expanded: list[str] = []
+    for term in direct:
+        for terms in glossary.values():
+            tokenized_terms = {token for value in terms for token in tokenize(value)}
+            raw_terms = {value.strip().lower() for value in terms if value.strip()}
+            if term not in tokenized_terms and term not in raw_terms:
+                continue
+            for value in terms:
+                for token in tokenize(value):
+                    if token not in direct_set and token not in expanded:
+                        expanded.append(token)
+                raw = value.strip().lower()
+                if raw and raw not in direct_set and raw not in expanded:
+                    expanded.append(raw)
+    return direct, expanded
+
+
+def has_mixed_scripts(text: str) -> bool:
+    has_cjk = any(is_cjk_char(char) for char in text)
+    has_latin = any("LATIN" in unicodedata.name(char, "") for char in text if char.isalpha())
+    return has_cjk and has_latin
+
+
 def is_profile_enabled(root: Path) -> bool:
     profiles, _ = load_profiles(root)
     return bool(profiles) or core_direction_complete(root)
@@ -730,6 +856,13 @@ def page_profile_eligible(page: dict[str, Any], profile: str | None, include_unp
     return include_unprofiled and not page_profiles
 
 
+def profile_retrieval_config(profiles: dict[str, dict[str, Any]], profile: str | None) -> dict[str, Any]:
+    if not profile:
+        return {}
+    retrieval = profiles.get(profile, {}).get("retrieval")
+    return retrieval if isinstance(retrieval, dict) else {}
+
+
 def retrieve(
     root: Path,
     query: str,
@@ -738,19 +871,25 @@ def retrieve(
     profile: str | None = None,
     include_unprofiled: bool = False,
 ) -> list[dict[str, Any]]:
+    profiles: dict[str, dict[str, Any]] = {}
     if profile:
         profiles, profile_errors = load_profiles(root)
         if profile_errors:
             raise ValueError("; ".join(profile_errors))
         if profile not in profiles:
             raise ValueError(f"unknown profile: {profile}")
+    retrieval_config = profile_retrieval_config(profiles, profile)
     memory_index, graph = load_retrieval_artifacts(root)
+    glossary, _ = load_glossary(root)
     pages = memory_index.get("pages", [])
-    query_terms = tokenize(query)
+    allow_glossary = retrieval_config.get("allow_glossary_expansion", True) is not False
+    query_terms, glossary_terms = expanded_query_terms(tokenize(query), glossary if allow_glossary else {})
     query_text = " ".join(query_terms)
     query_raw = query.strip().lower()
     scores: dict[str, float] = {}
+    primary_scores: dict[str, float] = {}
     reasons: dict[str, Counter[str]] = {}
+    match_types: dict[str, str] = {}
     by_path = {
         page["path"]: page
         for page in pages
@@ -762,50 +901,90 @@ def retrieve(
         reasons[page_path] = Counter()
         title = str(page.get("title", "")).lower()
         slug = str(page.get("slug", "")).lower()
+        path_stem = Path(str(page_path)).stem.lower()
         aliases = [item.lower() for item in normalize_list(page.get("aliases"))]
         tags = [item.lower() for item in normalize_list(page.get("tags"))]
         headings = [item.lower() for item in normalize_list(page.get("headings"))]
         summary = str(page.get("summary", "")).lower()
         search_text = str(page.get("search_text", "")).lower()
         title_tokens = set(tokenize(title))
+        path_stem_tokens = set(tokenize(path_stem))
         heading_tokens = set(token for heading in headings for token in tokenize(heading))
         summary_tokens = set(tokenize(summary))
         alias_tokens = set(token for alias in aliases for token in tokenize(alias))
         tag_tokens = set(token for tag in tags for token in tokenize(tag))
         search_counts = Counter(tokenize(search_text))
+        glossary_counts = Counter(glossary_terms)
         score = 0.0
+        primary_score = 0.0
 
         if query.strip().lower() in {title, slug, *aliases}:
             score += 60
+            primary_score += 60
             reasons[page_path]["exact"] += 1
+        normalized_page_path = str(page_path).lower()
+        normalized_page_path_no_ext = str(Path(str(page_path)).with_suffix("")).lower()
+        if query_raw and query_raw in {normalized_page_path, normalized_page_path_no_ext}:
+            score += 30
+            primary_score += 30
+            reasons[page_path]["path"] += 1
+        if query_raw and query_raw == path_stem:
+            score += 30
+            primary_score += 30
+            reasons[page_path]["path_stem"] += 1
         if (query_text and query_text in summary) or (query_raw and query_raw in summary):
             score += 20
+            primary_score += 20
             reasons[page_path]["summary_phrase"] += 1
         for term in query_terms:
             if term == slug:
                 score += 12
+                primary_score += 12
                 reasons[page_path]["slug"] += 1
+            if term == path_stem or term in path_stem_tokens:
+                score += 7
+                primary_score += 7
+                reasons[page_path]["path_stem"] += 1
             if term in title_tokens:
                 score += 10
+                primary_score += 10
                 reasons[page_path]["title"] += 1
             if term in aliases or term in alias_tokens:
                 score += 9
+                primary_score += 9
                 reasons[page_path]["alias"] += 1
+                if has_mixed_scripts(" ".join([query, " ".join(aliases)])):
+                    reasons[page_path]["cross_lingual_alias"] += 1
             if term in tags or term in tag_tokens:
                 score += 8
+                primary_score += 8
                 reasons[page_path]["tag"] += 1
             if term in heading_tokens:
                 score += 5
+                primary_score += 5
                 reasons[page_path]["heading"] += 1
             if term in summary_tokens:
                 score += 4
+                primary_score += 4
                 reasons[page_path]["summary"] += 1
             occurrences = search_counts.get(term, 0)
             if occurrences:
                 score += min(occurrences, 8) * 0.75
+                primary_score += min(occurrences, 8) * 0.75
                 reasons[page_path]["lexical"] += occurrences
-        matched_score = score
-        if matched_score > 0:
+        for term, count in glossary_counts.items():
+            if term in title_tokens or term in alias_tokens or term in tag_tokens or term in heading_tokens or term in summary_tokens:
+                increment = min(count, 4) * 2.5
+                score += increment
+                primary_score += increment
+                reasons[page_path]["glossary"] += count
+            occurrences = search_counts.get(term, 0)
+            if occurrences:
+                increment = min(occurrences, 4) * 0.35
+                score += increment
+                primary_score += increment
+                reasons[page_path]["glossary"] += occurrences
+        if primary_score > 0:
             page_profiles = normalize_list(page.get("profiles"))
             if profile and profile in page_profiles:
                 score += 3
@@ -815,7 +994,10 @@ def retrieve(
                 reasons[page_path]["unprofiled"] += 1
             if page.get("updated"):
                 score += 0.1
+                reasons[page_path]["freshness"] += 1
             scores[page_path] = score
+            primary_scores[page_path] = primary_score
+            match_types[page_path] = "seed"
 
     if expand_links and scores:
         outgoing = graph.get("outgoing", {}) if isinstance(graph.get("outgoing"), dict) else {}
@@ -825,6 +1007,8 @@ def retrieve(
             for neighbor in set(outgoing.get(seed, []) + incoming.get(seed, [])):
                 if neighbor in by_path and neighbor not in scores:
                     scores[neighbor] = max(scores[seed] * 0.25, 1.0)
+                    primary_scores[neighbor] = 0.0
+                    match_types[neighbor] = "context"
                     reasons.setdefault(neighbor, Counter())["one_hop"] += 1
 
     ranked = sorted(scores, key=lambda path: (-scores[path], by_path[path].get("title", ""), path))
@@ -837,11 +1021,15 @@ def retrieve(
                 "title": page.get("title", path),
                 "slug": page.get("slug", ""),
                 "score": round(scores[path], 3),
+                "primary_score": round(primary_scores.get(path, 0.0), 3),
+                "match_type": match_types.get(path, "seed"),
+                "seed": match_types.get(path, "seed") == "seed",
                 "summary": page.get("summary", ""),
                 "profiles": normalize_list(page.get("profiles")),
                 "confidence": page.get("confidence", "unknown"),
                 "contested": bool(page.get("contested", False)),
                 "reasons": sorted(reasons.get(path, Counter()).keys()),
+                "reason_counts": dict(sorted(reasons.get(path, Counter()).items())),
             }
         )
     return hits

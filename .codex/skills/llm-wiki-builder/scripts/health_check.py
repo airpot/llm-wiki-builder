@@ -15,7 +15,9 @@ sys.dont_write_bytecode = True
 from wiki_lib import (
     MARKDOWN_LINK_RE,
     build_memory_artifacts,
+    has_mixed_scripts,
     iter_wiki_pages,
+    load_glossary,
     load_profiles,
     normalize_list,
     page_headings,
@@ -84,6 +86,7 @@ def check_health(root: Path) -> dict[str, Any]:
     memory_index, link_graph = build_memory_artifacts(root)
     index_pages = [page for page in memory_index.get("pages", []) if isinstance(page, dict)]
     profiles, profile_errors = load_profiles(root)
+    glossary, glossary_errors = load_glossary(root)
     profile_page_counts = {profile_id: 0 for profile_id in profiles}
     eval_profile_counts = {profile_id: 0 for profile_id in profiles}
     tags_allowed = taxonomy_tags(root)
@@ -92,6 +95,8 @@ def check_health(root: Path) -> dict[str, Any]:
 
     for error in profile_errors:
         findings.append(finding("error", "profile-validation", "profiles/", error))
+    for error in glossary_errors:
+        findings.append(finding("warning", "glossary-validation", "glossary", error))
 
     for page_path in pages:
         page_rel = relpath(page_path, root)
@@ -155,6 +160,12 @@ def check_health(root: Path) -> dict[str, Any]:
         profile_id = case.get("profile_id")
         if profile_id in eval_profile_counts:
             eval_profile_counts[profile_id] += 1
+    mixed_eval_cases = [
+        case
+        for case in eval_cases
+        if has_mixed_scripts(str(case.get("query") or ""))
+        or "mixed-language" in {str(tag) for tag in normalize_list(case.get("tags"))}
+    ]
 
     query_entries, query_errors = read_jsonl(root / "query-log.jsonl")
     for error in query_errors:
@@ -164,6 +175,15 @@ def check_health(root: Path) -> dict[str, Any]:
         profile_id = entry.get("profile_id")
         if profile_id in profile_misses and entry.get("miss") is True:
             profile_misses[profile_id] += 1
+        if entry.get("miss") is True and has_mixed_scripts(str(entry.get("query") or "")):
+            findings.append(
+                finding(
+                    "info",
+                    "mixed-language-query-miss",
+                    "query-log.jsonl",
+                    f"mixed-language miss may need aliases or glossary terms: {entry.get('query')}",
+                )
+            )
 
     for profile_id, count in profile_page_counts.items():
         if count == 0:
@@ -178,6 +198,15 @@ def check_health(root: Path) -> dict[str, Any]:
             findings.append(
                 finding("warning", "profile-query-miss", f"profiles/{profile_id}.json", f"profile has {count} query misses")
             )
+    if glossary and not mixed_eval_cases:
+        findings.append(
+            finding(
+                "info",
+                "mixed-language-eval-coverage",
+                "retrieval-evals.jsonl",
+                "glossary exists but no mixed-language retrieval eval cases were found",
+            )
+        )
 
     counts: dict[str, int] = {"error": 0, "warning": 0, "info": 0}
     for item in findings:

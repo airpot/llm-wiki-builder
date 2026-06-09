@@ -5,15 +5,49 @@ Use deterministic file-first retrieval before answering from wiki memory.
 ## Ranking Order
 
 1. Load `memory-index.json` and `link-graph.json`. If either artifact is missing, invalid, or stale, retrieval rebuilds fresh artifacts in memory for that command; run `scripts/build_memory_index.py <wiki-root> --write` when you want to persist the refreshed files.
-2. Score exact title, slug, alias, and tag matches.
-3. Score lexical matches in summaries, headings, and page text, including deterministic Unicode/CJK token fallback without external segmentation dependencies.
+2. Tokenize the query locally, including deterministic Unicode/CJK fallback without external segmentation dependencies.
+3. Optionally expand query terms from explicit `glossary.json` or `glossary.jsonl` declarations.
 4. When `--profile <profile_id>` is provided, search only pages declaring that profile. Exclude unrelated-profile and unprofiled pages unless `--include-unprofiled` is explicitly set.
-5. Expand one hop through `link-graph.json` when linked pages add useful context; profile-filtered retrieval must not expand into unrelated-profile pages.
-6. Apply light recency weighting without overriding relevance.
-7. Surface `confidence=low` and `contested=true`.
-8. Cite wiki page paths in the answer.
+5. Score primary seed evidence: exact title, slug, page path, path stem, alias, tag, heading, summary, body lexical, or glossary-expanded matches.
+6. Apply secondary boosts only after primary evidence exists: selected profile, light freshness, and explicit unprofiled legacy handling.
+7. Expand one hop through `link-graph.json` only after at least one seed hit exists; profile-filtered retrieval must not expand into unrelated-profile pages.
+8. Surface `confidence=low` and `contested=true`.
+9. Cite wiki page paths in the answer.
+
+## Retrieval Contract
+
+A returned page is either a `seed` hit or a `context` expansion.
+
+Seed hits require positive primary evidence from page title, slug, exact page path, path stem, aliases, tags, headings, summary, body text, or explicit glossary expansion. Recency, profile compatibility, index presence, and one-hop links cannot create a seed hit.
+
+Context expansion is one-hop incoming or outgoing link context from seed hits. Context pages are useful background, but they must not be treated as the primary answer source unless the answer also explains why they were included.
+
+Hit objects include `score`, `primary_score`, `match_type`, `seed`, `reasons`, and `reason_counts` so agents can audit why a page was returned.
 
 Do not treat a retrieval hit as proof that a claim is true. It only selects candidate memory pages.
+
+## Bilingual And Mixed-Script Matching
+
+Mixed Chinese-English retrieval is deterministic and file-first:
+
+- page `aliases` and `tags` are the strongest way to declare cross-language terms;
+- optional `glossary.json` and `glossary.jsonl` map stable terms across languages;
+- glossary expansion is lower-weight than direct title, alias, tag, heading, summary, or body matches;
+- the retriever does not perform automatic translation or infer cross-language equivalence from Unicode ranges alone;
+- glossary and alias expansion must still obey profile filtering.
+
+`glossary.json` uses:
+
+```json
+{
+  "schema": "llm-wiki-glossary-v1",
+  "terms": [
+    {"canonical": "retrieval", "aliases": ["retrieval", "检索", "召回"]}
+  ]
+}
+```
+
+`glossary.jsonl` may contain the same term objects one per line. When both files exist, `glossary.json` loads first, then `glossary.jsonl`; validation reports duplicate canonical terms or conflicting alias mappings.
 
 ## Miss Handling
 
@@ -37,6 +71,7 @@ Profile-filtered retrieval:
 - excludes unrelated-profile pages;
 - excludes unprofiled pages by default;
 - may include unprofiled pages with `--include-unprofiled`, ranked below true profile matches.
+- may disable glossary expansion when the selected profile declares `retrieval.allow_glossary_expansion: false`.
 
 ## Query Log Schema
 
@@ -54,3 +89,4 @@ Each JSONL entry should include:
 ```
 
 Additional fields such as scores, limit, or notes are allowed.
+New retrieval-contract fields may include `seed_pages`, `context_pages`, `primary_scores`, and `reason_counts`.

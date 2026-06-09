@@ -12,6 +12,7 @@ Created: {{created}}
 - `query-log.jsonl`
 - `retrieval-evals.jsonl`
 - `profiles/`
+- optional `glossary.json` or `glossary.jsonl`
 - `raw/`
 - `wiki/`
 - `reports/`
@@ -39,3 +40,9 @@ Raw notes preserve source meaning. Do not silently rewrite source claims, replac
 ## Extraction Profiles
 
 Profiles live under `profiles/*.json` and use schema `llm-wiki-extraction-profile-v1`. A profile controls what to extract, what to ignore, page types, granularity, evidence policy, conflict policy, output roots, required sections, and retrieval/eval expectations.
+
+## Retrieval Contract
+
+Retrieval returns seed hits only when a page has real title, slug, alias, tag, heading, summary, body lexical, or explicit glossary evidence. Recency, profile compatibility, and link expansion cannot create a seed hit. One-hop linked pages are context expansion and should be treated separately.
+
+Optional glossary files use schema `llm-wiki-glossary-v1` and map stable multilingual retrieval terms. Glossary entries are retrieval aids only; they do not establish source truth.
