@@ -23,6 +23,20 @@ Validate:
 
 Run `scripts/health_check.py` for zero-LLM structural preflight. It reports empty/stub pages, broken Markdown links, broken wikilinks, orphan pages, index completeness, log coverage, tag taxonomy drift, page size warnings, unprofiled pages, profiles with no pages, profiles with no eval cases, missing profile-required sections, profile-specific query misses, glossary issues, and mixed-language eval coverage gaps without applying fixes.
 
+Generated output directories such as `reports/context-packs/`, `reports/publish/html/`, and `reports/publish/mcp/` are safe to create mechanically when missing. They are rebuildable artifacts and should not be optimized semantically as if they were canonical wiki pages.
+
+## MCP Publish Quality Gates
+
+Run `scripts/publish_mcp_bundle.py` when publishing a wiki for agent systems. The generated `quality.json` should surface:
+
+- validation status, errors, and warnings;
+- health-check status, findings, and blocker counts;
+- retrieval eval metrics and profile gate failures when eval cases exist;
+- freshness status for `memory-index.json`, `link-graph.json`, and semantic HTML;
+- raw-source exclusion and read-only/path-confined publication policy.
+
+The first MCP publish target is contract-only and read-only. Do not add MCP write tools, remote HTTP/auth, raw-source publication, external models, embeddings, vector stores, crawlers, or non-standard-library runtime dependencies as part of safe fixes or optimization.
+
 ## Agent-Mediated Safe-Fix Mode
 
 Safe-fix mode is not a standalone auto-fix CLI. When the user explicitly requests safe fixes, the agent may use deterministic script output and apply only repairs whose target and replacement can be derived without semantic judgment:

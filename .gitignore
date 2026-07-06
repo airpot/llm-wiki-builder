@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+*.tgz
+.DS_Store
+.skvm/
+eval-runs/
+skillflows/*/runs/
+*-workspace/

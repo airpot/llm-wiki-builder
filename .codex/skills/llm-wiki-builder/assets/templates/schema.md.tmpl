@@ -17,6 +17,17 @@ Created: {{created}}
 - `wiki/`
 - `reports/`
 
+## Output Layers
+
+- `raw/` is the source-preserving layer. It keeps source notes and hashes.
+- `wiki/**/*.md` is the canonical compiled wiki layer. Humans and agents may review or maintain these Markdown files.
+- `memory-index.json` and `link-graph.json` are generated retrieval accelerators.
+- `reports/context-packs/` stores generated query/task context packs for agents.
+- `reports/publish/html/` stores generated semantic HTML views for publication or model-friendly reading.
+- `reports/publish/mcp/` stores generated read-only MCP-ready bundles for agent systems.
+
+Generated context packs, HTML, and MCP bundles are rebuildable artifacts. Do not treat them as authoritative memory or edit them instead of `wiki/**/*.md`.
+
 ## Wiki Core Direction
 
 {{core_direction}}

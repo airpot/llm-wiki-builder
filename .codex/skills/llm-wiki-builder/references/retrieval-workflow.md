@@ -26,6 +26,28 @@ Hit objects include `score`, `primary_score`, `match_type`, `seed`, `reasons`, a
 
 Do not treat a retrieval hit as proof that a claim is true. It only selects candidate memory pages.
 
+## Context Packs
+
+For agent task execution, prefer a generated context pack over ad hoc full-page reads when the user asks for bounded task/query context. Use `scripts/build_context_pack.py` after deterministic retrieval. A context pack records:
+
+- the query, retrieval mode, profile filters, limit, and excerpt budget;
+- seed hits and one-hop context hits separately;
+- page path, title, summary, confidence, contested status, profiles, sources, scores, match type, reasons, and reason counts;
+- bounded excerpts from canonical Markdown page bodies.
+
+Context packs are generated artifacts under `reports/context-packs/`. They are not canonical memory and may be deleted and rebuilt. If a context pack surfaces `confidence=low`, `confidence=unknown`, or `contested=true`, the agent must carry that uncertainty into the answer.
+
+## MCP Agent Access
+
+For agent systems, prefer the generated MCP bundle under `reports/publish/mcp/` as the stable access layer. MCP tools must use the same deterministic file-first retrieval contract:
+
+- `wiki_search` returns seed and one-hop context hits with scores, match type, reasons, confidence, contested status, profiles, and citations.
+- `wiki_read` may read published Markdown, semantic HTML, or metadata, but must stay path-confined to the wiki root or snapshot root.
+- `wiki_context_pack` generates bounded context packs instead of exposing whole-wiki dumps.
+- `wiki_quality_report` surfaces validation, health, retrieval eval, and freshness status before an agent relies on the wiki.
+
+MCP access does not make retrieval hits true claims. Agents must still cite wiki page paths, preserve uncertainty, and report misses when deterministic retrieval lacks adequate memory.
+
 ## Bilingual And Mixed-Script Matching
 
 Mixed Chinese-English retrieval is deterministic and file-first:

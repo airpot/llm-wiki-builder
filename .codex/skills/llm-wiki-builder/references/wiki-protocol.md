@@ -32,9 +32,47 @@
     health/
     optimization/
     retrieval/
+    context-packs/
+    publish/
+      html/
+      mcp/
 ```
 
 Create missing files and directories without overwriting existing user files. `profiles/` stores extraction profile JSON. Optional `glossary.json` or `glossary.jsonl` stores explicit multilingual retrieval term mappings. `raw/` stores source-preserving notes. `wiki/` stores agent-maintained compiled pages. `reports/` stores local validation, optimization, and retrieval evidence.
+
+## Output Layers
+
+An LLM wiki has separate source, retrieval, agent-consumption, and publish/view layers:
+
+- `raw/` is the source-preserving layer. It keeps source body text and provenance metadata.
+- `wiki/**/*.md` is the canonical compiled knowledge layer. It is the durable editable memory for humans and agents.
+- `memory-index.json` and `link-graph.json` are generated retrieval accelerators derived from `wiki/`.
+- `reports/context-packs/` stores generated agent-ready context packs for a query or task.
+- `reports/publish/html/` stores generated semantic HTML views derived from `wiki/`.
+- `reports/publish/mcp/` stores the generated read-only MCP-ready bundle for agent systems.
+
+Generated context packs, HTML, and MCP bundles are rebuildable artifacts. They must not be treated as authoritative wiki memory, and retrieval must continue to build from `wiki/**/*.md`, not from generated HTML or MCP artifacts.
+
+## MCP Publish Target
+
+`reports/publish/mcp/` is the primary agent-facing publish target. It is generated from canonical Markdown pages, retrieval artifacts, context-pack contracts, and semantic HTML. First-release bundles are local, read-only, and stdio-first at the contract level; executable MCP server adapters are optional follow-up work unless they can remain dependency-light.
+
+Required generated files:
+
+- `manifest.json` using `schema: llm-wiki-mcp-publish-v1`;
+- `resources.json` declaring manifest, index, page, HTML, graph, memory-index, and quality resources;
+- `tools.json` declaring read-only `wiki_search`, `wiki_read`, `wiki_context_pack`, and `wiki_quality_report` contracts;
+- `prompts.json` declaring `answer_with_wiki`, `inspect_wiki_gaps`, and `prepare_context_pack`;
+- `quality.json` summarizing validation, health, retrieval evals, freshness, blockers, and warnings;
+- `server-config.json` declaring transport/adaptor status and read-only safety policy;
+- `README.md` explaining the generated bundle.
+
+Publication modes:
+
+- `linked` points resources at the live local wiki root.
+- `snapshot` copies only the published subset under `reports/publish/mcp/snapshot/`; it excludes `raw/` by default.
+
+MCP publish artifacts must be path-confined to the wiki root, must not require secrets, network access, external models, vector stores, crawlers, or non-standard-library dependencies, and must surface low-confidence or contested pages through search/context/quality metadata.
 
 ## Wiki Core Direction
 

@@ -46,6 +46,9 @@ BASELINE_DIRS = [
     "reports/health",
     "reports/optimization",
     "reports/retrieval",
+    "reports/context-packs",
+    "reports/publish/html",
+    "reports/publish/mcp",
 ]
 
 BASELINE_FILES = [

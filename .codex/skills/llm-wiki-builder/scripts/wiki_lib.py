@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import re
 import sys
@@ -39,6 +40,9 @@ REQUIRED_DIRS = [
     "reports/health",
     "reports/optimization",
     "reports/retrieval",
+    "reports/context-packs",
+    "reports/publish/html",
+    "reports/publish/mcp",
 ]
 
 PROFILE_DIR = "profiles"
@@ -557,6 +561,145 @@ def iter_wiki_pages(root: Path) -> list[Path]:
     if not wiki.exists():
         return []
     return sorted(path for path in wiki.rglob("*.md") if path.is_file())
+
+
+def read_wiki_page(root: Path, page_path: str) -> tuple[dict[str, Any], str]:
+    path = root / page_path
+    text = path.read_text(encoding="utf-8")
+    return parse_frontmatter(text)
+
+
+def excerpt_text(text: str, max_chars: int) -> str:
+    body = text.strip()
+    if max_chars <= 0 or len(body) <= max_chars:
+        return body
+    cutoff = body.rfind("\n\n", 0, max_chars)
+    if cutoff < max_chars // 2:
+        cutoff = body.rfind("\n", 0, max_chars)
+    if cutoff < max_chars // 2:
+        cutoff = max_chars
+    return body[:cutoff].rstrip() + "\n\n[excerpt truncated]"
+
+
+def markdown_to_semantic_html(markdown: str) -> str:
+    lines = markdown.splitlines()
+    out: list[str] = []
+    paragraph: list[str] = []
+    list_stack: list[str] = []
+    in_code = False
+    code_lines: list[str] = []
+    in_blockquote = False
+    blockquote_lines: list[str] = []
+    in_table = False
+    table_rows: list[str] = []
+
+    def inline(value: str) -> str:
+        escaped = html.escape(value)
+        escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+        escaped = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', escaped)
+        escaped = re.sub(r"\[\[([^\]|]+)\|([^\]]+)\]\]", r"<span data-wikilink=\"\1\">\2</span>", escaped)
+        escaped = re.sub(r"\[\[([^\]]+)\]\]", r"<span data-wikilink=\"\1\">\1</span>", escaped)
+        return escaped
+
+    def close_paragraph() -> None:
+        nonlocal paragraph
+        if paragraph:
+            out.append(f"<p>{inline(' '.join(paragraph))}</p>")
+            paragraph = []
+
+    def close_lists() -> None:
+        nonlocal list_stack
+        if list_stack:
+            out.append("<ul>")
+            out.extend(f"<li>{inline(item)}</li>" for item in list_stack)
+            out.append("</ul>")
+            list_stack = []
+
+    def close_blockquote() -> None:
+        nonlocal in_blockquote, blockquote_lines
+        if in_blockquote:
+            out.append("<blockquote>")
+            out.extend(f"<p>{inline(line)}</p>" for line in blockquote_lines if line.strip())
+            out.append("</blockquote>")
+            in_blockquote = False
+            blockquote_lines = []
+
+    def close_table() -> None:
+        nonlocal in_table, table_rows
+        if not in_table:
+            return
+        rows = [row for row in table_rows if row.strip()]
+        out.append("<table>")
+        for index, row in enumerate(rows):
+            cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
+            if index == 1 and all(set(cell.replace(":", "").strip()) <= {"-"} for cell in cells):
+                continue
+            tag = "th" if index == 0 and len(rows) > 1 else "td"
+            out.append("<tr>" + "".join(f"<{tag}>{inline(cell)}</{tag}>" for cell in cells) + "</tr>")
+        out.append("</table>")
+        in_table = False
+        table_rows = []
+
+    def close_blocks() -> None:
+        close_paragraph()
+        close_lists()
+        close_blockquote()
+        close_table()
+
+    for raw in lines:
+        line = raw.rstrip()
+        if line.startswith("```"):
+            if in_code:
+                out.append("<pre><code>" + html.escape("\n".join(code_lines)) + "</code></pre>")
+                in_code = False
+                code_lines = []
+            else:
+                close_blocks()
+                in_code = True
+                code_lines = []
+            continue
+        if in_code:
+            code_lines.append(line)
+            continue
+        if line.startswith("|") and line.endswith("|"):
+            close_paragraph()
+            close_lists()
+            close_blockquote()
+            in_table = True
+            table_rows.append(line)
+            continue
+        elif in_table:
+            close_table()
+        heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if heading:
+            close_blocks()
+            level = len(heading.group(1))
+            out.append(f"<h{level}>{inline(heading.group(2))}</h{level}>")
+            continue
+        if line.startswith(">"):
+            close_paragraph()
+            close_lists()
+            close_table()
+            in_blockquote = True
+            blockquote_lines.append(line.lstrip("> ").strip())
+            continue
+        if re.match(r"^\s*[-*]\s+", line):
+            close_paragraph()
+            close_blockquote()
+            close_table()
+            list_stack.append(re.sub(r"^\s*[-*]\s+", "", line))
+            continue
+        if not line.strip():
+            close_blocks()
+            continue
+        close_lists()
+        close_blockquote()
+        paragraph.append(line.strip())
+
+    if in_code:
+        out.append("<pre><code>" + html.escape("\n".join(code_lines)) + "</code></pre>")
+    close_blocks()
+    return "\n".join(out)
 
 
 def page_headings(body: str) -> list[str]:

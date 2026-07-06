@@ -12,7 +12,10 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 
 from health_check import check_health
+from build_context_pack import build_context_pack, markdown_context_pack
 from init_wiki import init_wiki
+from publish_mcp_bundle import confined_path, publish_mcp_bundle
+from publish_semantic_html import publish_html
 from validate_wiki import validate_wiki
 from wiki_lib import build_memory_artifacts, retrieve, source_body_hash, tokenize, write_json
 
@@ -493,6 +496,11 @@ def check_initialization_contract(root: Path) -> int:
         print("error: normal init did not create expected profile files")
         print(normal_result.stdout)
         return 1
+    for generated_dir in ("reports/context-packs", "reports/publish/html", "reports/publish/mcp"):
+        if not (normal_root / generated_dir).is_dir():
+            print(f"error: normal init did not create generated output directory: {generated_dir}")
+            print(normal_result.stdout)
+            return 1
     schema_text = (normal_root / "SCHEMA.md").read_text(encoding="utf-8")
     if "## Wiki Core Direction" not in schema_text or "unspecified" in schema_text.lower():
         print("error: normal init did not persist a complete core direction")
@@ -566,6 +574,88 @@ def main() -> int:
             print(context_hits)
             return 1
 
+        context_pack = build_context_pack(root, "seed expected misses", limit=5, profile="core", max_chars_per_page=60)
+        if context_pack["seed_pages"] != ["wiki/concepts/retrieval-contract.md"]:
+            print("error: context pack did not preserve seed page split")
+            print(json.dumps(context_pack, indent=2, ensure_ascii=False))
+            return 1
+        if "wiki/concepts/context-expansion.md" not in context_pack["context_pages"]:
+            print("error: context pack did not preserve one-hop context page split")
+            print(json.dumps(context_pack, indent=2, ensure_ascii=False))
+            return 1
+        if not all("sources" in page and "excerpt" in page for page in context_pack["pages"]):
+            print("error: context pack pages lack sources or excerpts")
+            print(json.dumps(context_pack, indent=2, ensure_ascii=False))
+            return 1
+        if "[excerpt truncated]" not in markdown_context_pack(context_pack):
+            print("error: context pack markdown did not show bounded excerpt truncation")
+            print(markdown_context_pack(context_pack))
+            return 1
+
+        context_pack_result = run_command(
+            [
+                sys.executable,
+                str(SCRIPT_DIR / "build_context_pack.py"),
+                str(root),
+                "seed expected misses",
+                "--profile",
+                "core",
+                "--max-chars-per-page",
+                "60",
+                "--json",
+            ]
+        )
+        if context_pack_result.returncode != 0:
+            print("error: context pack script failed")
+            print(context_pack_result.stdout)
+            print(context_pack_result.stderr)
+            return 1
+        context_pack_json = json.loads(context_pack_result.stdout)
+        if not context_pack_json.get("report") or not Path(context_pack_json["report"]).exists():
+            print("error: context pack script did not write markdown report")
+            print(context_pack_result.stdout)
+            return 1
+        if not context_pack_json.get("report_json") or not Path(context_pack_json["report_json"]).exists():
+            print("error: context pack script did not write JSON report")
+            print(context_pack_result.stdout)
+            return 1
+
+        html_manifest = publish_html(root, clean=True)
+        if html_manifest["page_count"] != 7:
+            print("error: semantic HTML publish page count mismatch")
+            print(json.dumps(html_manifest, indent=2, ensure_ascii=False))
+            return 1
+        index_html = root / "reports" / "publish" / "html" / "index.html"
+        contract_html = root / "reports" / "publish" / "html" / "pages" / "wiki-concepts-retrieval-contract.html"
+        if not index_html.exists() or not contract_html.exists():
+            print("error: semantic HTML publish did not create expected files")
+            print(json.dumps(html_manifest, indent=2, ensure_ascii=False))
+            return 1
+        contract_text = contract_html.read_text(encoding="utf-8")
+        if "<article" not in contract_text or "data-confidence=\"medium\"" not in contract_text:
+            print("error: semantic HTML page lacks article metadata")
+            print(contract_text)
+            return 1
+        if "<section data-role=\"body\">" not in contract_text or "<h1>Retrieval Contract</h1>" not in contract_text:
+            print("error: semantic HTML page lacks body section or heading")
+            print(contract_text)
+            return 1
+        if "wiki/concepts/retrieval-contract.md" not in index_html.read_text(encoding="utf-8"):
+            print("error: semantic HTML index lacks source path metadata")
+            print(index_html.read_text(encoding="utf-8"))
+            return 1
+
+        html_result = run_command([sys.executable, str(SCRIPT_DIR / "publish_semantic_html.py"), str(root), "--clean", "--json"])
+        if html_result.returncode != 0:
+            print("error: semantic HTML publish script failed")
+            print(html_result.stdout)
+            print(html_result.stderr)
+            return 1
+        if json.loads(html_result.stdout).get("page_count") != 7:
+            print("error: semantic HTML publish script JSON manifest page count mismatch")
+            print(html_result.stdout)
+            return 1
+
         eval_result = run_command([sys.executable, str(SCRIPT_DIR / "evaluate_retrieval.py"), str(root), "--json"])
         if eval_result.returncode == 0:
             print("error: retrieval eval unexpectedly passed with context-only expected page")
@@ -600,6 +690,105 @@ def main() -> int:
         if eval_json.get("negative_cases") != 1 or eval_json.get("miss_accuracy") != 1.0:
             print("error: negative retrieval metrics did not meet lifecycle expectations")
             print(eval_result.stdout)
+            return 1
+
+        mcp_manifest = publish_mcp_bundle(root, mode="linked", clean=True)
+        mcp_root = root / "reports" / "publish" / "mcp"
+        for rel in ("manifest.json", "resources.json", "tools.json", "prompts.json", "quality.json", "server-config.json", "README.md"):
+            if not (mcp_root / rel).exists():
+                print(f"error: MCP bundle did not create {rel}")
+                print(json.dumps(mcp_manifest, indent=2, ensure_ascii=False))
+                return 1
+        if mcp_manifest.get("schema") != "llm-wiki-mcp-publish-v1" or mcp_manifest.get("contract_status") != "pass":
+            print("error: MCP manifest schema or contract status mismatch")
+            print(json.dumps(mcp_manifest, indent=2, ensure_ascii=False))
+            return 1
+        mcp_quality = json.loads((mcp_root / "quality.json").read_text(encoding="utf-8"))
+        if mcp_quality.get("status") != "pass":
+            print("error: MCP quality report did not pass after passing retrieval evals")
+            print(json.dumps(mcp_quality, indent=2, ensure_ascii=False))
+            return 1
+        mcp_resources = json.loads((mcp_root / "resources.json").read_text(encoding="utf-8"))
+        if not any(item.get("uri") == "llm-wiki://quality" for item in mcp_resources.get("resources", [])):
+            print("error: MCP resources did not expose quality resource")
+            print(json.dumps(mcp_resources, indent=2, ensure_ascii=False))
+            return 1
+        mcp_tools = json.loads((mcp_root / "tools.json").read_text(encoding="utf-8"))
+        tool_names = {tool.get("name") for tool in mcp_tools.get("tools", [])}
+        if {"wiki_search", "wiki_read", "wiki_context_pack", "wiki_quality_report"} - tool_names:
+            print("error: MCP tools contract missing required tools")
+            print(json.dumps(mcp_tools, indent=2, ensure_ascii=False))
+            return 1
+        mcp_config = json.loads((mcp_root / "server-config.json").read_text(encoding="utf-8"))
+        if mcp_config.get("status") != "contract-only" or mcp_config.get("policy", {}).get("read_only") is not True:
+            print("error: MCP server config did not declare contract-only read-only policy")
+            print(json.dumps(mcp_config, indent=2, ensure_ascii=False))
+            return 1
+        linked_page_resources = [
+            item for item in mcp_resources.get("resources", [])
+            if str(item.get("id", "")).startswith("page-md-")
+        ]
+        if not linked_page_resources or any(item.get("path_scope") != "wiki-root" for item in linked_page_resources):
+            print("error: linked MCP page resources should point at wiki-root")
+            print(json.dumps(mcp_resources, indent=2, ensure_ascii=False))
+            return 1
+        try:
+            confined_path(root, "../outside")
+        except ValueError:
+            pass
+        else:
+            print("error: MCP path confinement accepted escaping path")
+            return 1
+
+        snapshot_manifest = publish_mcp_bundle(root, mode="snapshot", clean=True)
+        snapshot_root = root / "reports" / "publish" / "mcp" / "snapshot"
+        if snapshot_manifest.get("mode") != "snapshot" or not (snapshot_root / "wiki").is_dir():
+            print("error: MCP snapshot bundle missing wiki snapshot")
+            print(json.dumps(snapshot_manifest, indent=2, ensure_ascii=False))
+            return 1
+        if (snapshot_root / "raw").exists():
+            print("error: MCP snapshot bundle exposed raw sources by default")
+            return 1
+        snapshot_resources = json.loads((mcp_root / "resources.json").read_text(encoding="utf-8"))
+        for item in snapshot_resources.get("resources", []):
+            path = str(item.get("path") or "")
+            if "raw" in Path(path).parts:
+                print("error: MCP snapshot resource exposed raw path")
+                print(json.dumps(snapshot_resources, indent=2, ensure_ascii=False))
+                return 1
+            if item.get("path_scope") != "bundle-root":
+                print("error: MCP snapshot resource escaped bundle-root scope")
+                print(json.dumps(snapshot_resources, indent=2, ensure_ascii=False))
+                return 1
+            resource_id = str(item.get("id") or "")
+            if (
+                resource_id in {"index", "graph", "memory-index"}
+                or resource_id.startswith("page-md-")
+                or resource_id.startswith("page-html-")
+            ) and not path.startswith("snapshot/"):
+                print("error: MCP snapshot published resource did not use snapshot path")
+                print(json.dumps(snapshot_resources, indent=2, ensure_ascii=False))
+                return 1
+        mcp_result = run_command(
+            [
+                sys.executable,
+                str(SCRIPT_DIR / "publish_mcp_bundle.py"),
+                str(root),
+                "--mode",
+                "snapshot",
+                "--clean",
+                "--strict",
+                "--json",
+            ]
+        )
+        if mcp_result.returncode != 0:
+            print("error: MCP publish script failed in strict snapshot mode")
+            print(mcp_result.stdout)
+            print(mcp_result.stderr)
+            return 1
+        if json.loads(mcp_result.stdout).get("mode") != "snapshot":
+            print("error: MCP publish script did not report snapshot mode")
+            print(mcp_result.stdout)
             return 1
 
         min_score_case = {
@@ -651,6 +840,13 @@ def main() -> int:
         if not any("memory-index.json content is stale" in warning for warning in stale_validation["warnings"]):
             print("error: stale memory index warning was not detected")
             print(json.dumps(stale_validation, indent=2, ensure_ascii=False))
+            return 1
+        stale_mcp_manifest = publish_mcp_bundle(root, mode="linked", clean=True)
+        stale_quality = json.loads((root / "reports" / "publish" / "mcp" / "quality.json").read_text(encoding="utf-8"))
+        stale_status = stale_quality.get("freshness", {}).get("memory-index.json", {}).get("status")
+        if stale_status != "stale":
+            print("error: MCP quality report did not surface stale memory index")
+            print(json.dumps({"manifest": stale_mcp_manifest, "quality": stale_quality}, indent=2, ensure_ascii=False))
             return 1
         stale_strict = run_command([sys.executable, str(SCRIPT_DIR / "validate_wiki.py"), str(root), "--strict"])
         if stale_strict.returncode == 0:
