@@ -1,5 +1,4 @@
 interface:
   display_name: "LLM Wiki Builder"
   short_description: "Markdown LLM wiki builder"
-  default_prompt: "Use $llm-wiki-builder to build, query, validate, optimize, or benchmark a durable Markdown LLM wiki."
-
+  default_prompt: "Use $llm-wiki-builder to build, query, validate, optimize, or publish a durable Markdown LLM wiki, confirming its Delivery Contract before normal initialization."

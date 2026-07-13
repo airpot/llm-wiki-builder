@@ -5,6 +5,7 @@ Created: {{created}}
 ## Required Files
 
 - `SCHEMA.md`
+- `delivery-contract.json`
 - `index.md`
 - `log.md`
 - `memory-index.json`
@@ -22,17 +23,21 @@ Created: {{created}}
 - `raw/` is the source-preserving layer. It keeps source notes and hashes.
 - `wiki/**/*.md` is the canonical compiled wiki layer. Humans and agents may review or maintain these Markdown files.
 - `memory-index.json` and `link-graph.json` are generated retrieval accelerators.
-- `reports/context-packs/` stores generated query/task context packs for agents.
-- `reports/publish/html/` stores generated semantic HTML views for publication or model-friendly reading.
-- `reports/publish/mcp/` stores generated read-only MCP-ready bundles for agent systems.
+- `reports/context-packs/` stores generated query/task context packs for agents, including aggregate excerpt budgets and bounded localized chunks with section ids, heading paths, offsets, and excerpt hashes.
+- `reports/publish/html/` stores generated semantic HTML views for publication or model-friendly reading, including collision-free page names, safe rewritten local links, stable heading/section anchors, and embedded page metadata.
+- `reports/publish/mcp/` stores generated path-confined executable read-only stdio MCP bundles, allowlisted portable snapshots, quality guidance, schemas, and wiki-specific thin companion Skills.
 
-Generated context packs, HTML, and MCP bundles are rebuildable artifacts. Do not treat them as authoritative memory or edit them instead of `wiki/**/*.md`.
+Generated context packs, HTML, schemas, and MCP bundles are rebuildable artifacts. Do not treat them as authoritative memory or edit them instead of `wiki/**/*.md`.
 
 ## Wiki Core Direction
 
 {{core_direction}}
 
 Normal initialization records the confirmed wiki purpose here. Draft initialization marks this section incomplete; complete it before relying on strict validation or profile-aware ingest.
+
+## Delivery Contract
+
+`delivery-contract.json` records the confirmed final publication form. The normal default is canonical Markdown plus an executable read-only local stdio MCP snapshot and a wiki-specific thin Skill. Confirm or override the default during the initial purpose interview. Linked MCP mode is intended for local development; snapshot mode is the final-publication default.
 
 ## Page Frontmatter
 

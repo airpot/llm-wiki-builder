@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""Generated read-only stdio MCP server for a published LLM wiki."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from pathlib import Path
+from typing import Any
+
+from mcp.server.fastmcp import FastMCP
+
+
+BUNDLE_ROOT = Path(__file__).resolve().parent
+
+
+def _json(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"expected JSON object: {path}")
+    return data
+
+
+MANIFEST = _json(BUNDLE_ROOT / "manifest.json")
+MODE = str(MANIFEST.get("mode") or "snapshot")
+DATA_ROOT = (BUNDLE_ROOT / "snapshot").resolve() if MODE == "snapshot" else Path(str(MANIFEST["root"])).resolve()
+MCP = FastMCP("LLM Wiki")
+
+
+def _confined(root: Path, relative: str) -> Path:
+    candidate = Path(relative)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise ValueError(f"path escapes published root: {relative}")
+    resolved = (root / candidate).resolve()
+    if resolved != root and root not in resolved.parents:
+        raise ValueError(f"path escapes published root: {relative}")
+    return resolved
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _tokens(value: str) -> list[str]:
+    return [token.lower() for token in re.findall(r"[\w]+", value, flags=re.UNICODE) if token]
+
+
+def _expanded_terms(query: str) -> list[str]:
+    terms = set(_tokens(query))
+    glossary_entries: list[dict[str, Any]] = []
+    glossary_json = DATA_ROOT / "glossary.json"
+    if glossary_json.is_file():
+        try:
+            glossary_data = _json(glossary_json)
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+            glossary_data = {}
+        terms_value = glossary_data.get("terms", []) if isinstance(glossary_data, dict) else []
+        if isinstance(terms_value, list):
+            glossary_entries.extend(item for item in terms_value if isinstance(item, dict))
+    glossary_jsonl = DATA_ROOT / "glossary.jsonl"
+    if glossary_jsonl.is_file():
+        try:
+            glossary_lines = glossary_jsonl.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            glossary_lines = []
+        for line in glossary_lines:
+            if line.strip():
+                try:
+                    value = json.loads(line)
+                except (UnicodeError, json.JSONDecodeError):
+                    continue
+                if isinstance(value, dict):
+                    glossary_entries.append(value)
+    for entry in glossary_entries:
+        if not isinstance(entry, dict):
+            continue
+        related = [str(entry.get("canonical") or ""), *(str(item) for item in entry.get("aliases", []))]
+        related_terms = {token for value in related for token in _tokens(value)}
+        if terms & related_terms:
+            terms.update(related_terms)
+    return sorted(terms)
+
+
+def _memory_index() -> dict[str, Any]:
+    return _json(_confined(DATA_ROOT, "memory-index.json"))
+
+
+def _pages() -> list[dict[str, Any]]:
+    return [page for page in _memory_index().get("pages", []) if isinstance(page, dict)]
+
+
+def _eligible(page: dict[str, Any], profile_id: str | None, include_unprofiled: bool) -> bool:
+    profiles = [str(item) for item in page.get("profiles", [])]
+    return not profile_id or profile_id in profiles or (include_unprofiled and not profiles)
+
+
+def _hit(page: dict[str, Any], score: float, match_type: str, reasons: list[str]) -> dict[str, Any]:
+    return {
+        "path": page.get("path"),
+        "title": str(page.get("title") or ""),
+        "summary": page.get("summary", ""),
+        "confidence": page.get("confidence", "unknown"),
+        "contested": bool(page.get("contested", False)),
+        "profiles": [str(item) for item in page.get("profiles", [])],
+        "score": float(score),
+        "primary_score": float(score) if match_type == "seed" else 0.0,
+        "match_type": match_type,
+        "seed": match_type == "seed",
+        "reasons": reasons,
+        "reason_counts": {reason: 1 for reason in reasons},
+    }
+
+
+def _page(identifier: str) -> dict[str, Any]:
+    wanted = identifier.strip().lower()
+    matches: list[dict[str, Any]] = []
+    for page in _pages():
+        path = str(page.get("path") or "")
+        keys = {
+            path.lower(),
+            Path(path).stem.lower(),
+            str(page.get("slug") or "").lower(),
+            str(page.get("title") or "").lower(),
+            *(str(alias).lower() for alias in page.get("aliases", [])),
+        }
+        if wanted in keys:
+            matches.append(page)
+    if len(matches) != 1:
+        raise ValueError(f"page identifier must resolve uniquely: {identifier}")
+    return matches[0]
+
+
+def _section_index(path: str) -> list[dict[str, Any]]:
+    manifest_path = _confined(DATA_ROOT, "reports/publish/html/manifest.json")
+    if not manifest_path.exists():
+        return []
+    manifest = _json(manifest_path)
+    detail = next((item for item in manifest.get("page_details", []) if item.get("path") == path), {})
+    return detail.get("sections", []) if isinstance(detail, dict) else []
+
+
+@MCP.tool()
+def wiki_search(
+    query: str,
+    profile_id: str | None = None,
+    k: int = 5,
+    include_unprofiled: bool = False,
+) -> dict[str, Any]:
+    """Search the published compiled wiki without external services."""
+    if not query.strip() or k < 1 or k > 50:
+        raise ValueError("query is required and k must be between 1 and 50")
+    terms = _expanded_terms(query)
+    pages = _pages()
+    by_path = {str(page.get("path")): page for page in pages}
+    seed_hits: list[dict[str, Any]] = []
+    for page in pages:
+        if not _eligible(page, profile_id, include_unprofiled):
+            continue
+        title = str(page.get("title") or "")
+        slug = str(page.get("slug") or "")
+        aliases = [str(item) for item in page.get("aliases", [])]
+        searchable = str(page.get("search_text") or "").lower()
+        score = sum(searchable.count(term) for term in terms)
+        exact = query.strip().lower() in {title.lower(), slug.lower(), *(item.lower() for item in aliases)}
+        if exact:
+            score += 60
+        if score <= 0:
+            continue
+        seed_hits.append(_hit(page, float(score), "seed", ["exact"] if exact else ["lexical-or-glossary"]))
+    seed_hits.sort(key=lambda item: (-float(item["score"]), str(item["path"])))
+    selected = seed_hits[:k]
+    if len(selected) < k:
+        graph = _json(_confined(DATA_ROOT, "link-graph.json"))
+        seen = {str(item["path"]) for item in selected}
+        for seed in list(selected):
+            neighbors = set(graph.get("outgoing", {}).get(str(seed["path"]), []))
+            neighbors.update(graph.get("incoming", {}).get(str(seed["path"]), []))
+            for target in sorted(neighbors):
+                page = by_path.get(str(target))
+                if not page or str(target) in seen or not _eligible(page, profile_id, include_unprofiled):
+                    continue
+                selected.append(_hit(page, float(seed["score"]) * 0.1, "context", ["link_expansion"]))
+                seen.add(str(target))
+                if len(selected) >= k:
+                    break
+            if len(selected) >= k:
+                break
+    return {"hits": selected}
+
+
+@MCP.tool()
+def wiki_read(slug_or_path: str, format: str = "markdown") -> dict[str, Any]:
+    """Read one canonical page, generated HTML page, or page metadata."""
+    if format not in {"markdown", "html", "metadata"}:
+        raise ValueError("format must be markdown, html, or metadata")
+    page = _page(slug_or_path)
+    page_path = str(page["path"])
+    metadata = {
+        key: page.get(key)
+        for key in ("title", "summary", "confidence", "contested", "profiles", "sources", "headings")
+    }
+    metadata["section_index"] = _section_index(page_path)
+    canonical = format != "html"
+    generated = format == "html"
+    if format == "markdown":
+        published_path = _confined(DATA_ROOT, page_path)
+        content = published_path.read_text(encoding="utf-8")
+        result_path = page_path
+    elif format == "html":
+        html_manifest = _json(_confined(DATA_ROOT, "reports/publish/html/manifest.json"))
+        detail = next((item for item in html_manifest.get("page_details", []) if item.get("path") == page_path), None)
+        if not isinstance(detail, dict):
+            raise ValueError(f"HTML page is not published: {page_path}")
+        result_path = str(detail["html_path"])
+        content = _confined(DATA_ROOT, result_path).read_text(encoding="utf-8")
+    else:
+        result_path = page_path
+        content = json.dumps(metadata, ensure_ascii=False, sort_keys=True)
+    return {
+        "path": result_path,
+        "format": format,
+        "content": content,
+        "content_hash": _sha256(content),
+        "canonical": canonical,
+        "generated": generated,
+        "metadata": metadata,
+    }
+
+
+def _localized_window(content: str, query: str, budget: int) -> tuple[str, int]:
+    lowered = content.lower()
+    positions = [lowered.find(term) for term in _expanded_terms(query)]
+    positions = [position for position in positions if position >= 0]
+    center = min(positions) if positions else 0
+    start = max(0, center - budget // 3)
+    raw = content[start : start + budget]
+    leading = len(raw) - len(raw.lstrip())
+    return raw.strip(), start + leading
+
+
+def _markdown_body(content: str) -> str:
+    if not content.startswith("---\n"):
+        return content
+    marker = content.find("\n---\n", 4)
+    return content[marker + 5 :] if marker >= 0 else content
+
+
+def _localized_chunks(
+    body: str,
+    query: str,
+    hit: dict[str, Any],
+    sections: list[dict[str, Any]],
+    budget: int,
+    maximum: int,
+    sources: list[str],
+) -> list[dict[str, Any]]:
+    terms = _expanded_terms(query)
+    ranked: list[tuple[int, int, int, dict[str, Any]]] = []
+    for section in sections:
+        start = int(section.get("char_start", 0))
+        end = int(section.get("char_end", start))
+        text = body[start:end].lower()
+        heading = " ".join(str(item) for item in section.get("heading_path", [])).lower()
+        ranked.append(
+            (
+                sum(text.count(term) for term in terms),
+                sum(heading.count(term) for term in terms),
+                -(end - start),
+                section,
+            )
+        )
+    selected = [item[3] for item in sorted(ranked, key=lambda item: item[:3], reverse=True)[:maximum]]
+    selected.sort(key=lambda item: int(item.get("char_start", 0)))
+    chunks: list[dict[str, Any]] = []
+    remaining = budget
+    for index, section in enumerate(selected, start=1):
+        if remaining <= 0:
+            break
+        start = int(section.get("char_start", 0))
+        end = int(section.get("char_end", start))
+        per_chunk = max(1, remaining // (len(selected) - index + 1))
+        excerpt, local_start = _localized_window(body[start:end], query, per_chunk)
+        remaining -= len(excerpt)
+        chunks.append(
+            {
+                "chunk_id": f"{section.get('section_id')}-c{index}",
+                "path": hit["path"],
+                "section_id": section.get("section_id"),
+                "heading": section.get("heading", ""),
+                "heading_path": section.get("heading_path", []),
+                "char_start": start + local_start,
+                "char_end": start + local_start + len(excerpt),
+                "excerpt": excerpt,
+                "excerpt_hash": _sha256(excerpt)[:16],
+                "content_hash": section.get("content_hash", ""),
+                "confidence": hit.get("confidence", "unknown"),
+                "contested": bool(hit.get("contested", False)),
+                "sources": sources,
+                "match_type": hit.get("match_type", "seed"),
+                "score": hit.get("score", 0),
+                "primary_score": hit.get("primary_score", 0),
+                "reasons": hit.get("reasons", []),
+                "reason_counts": hit.get("reason_counts", {}),
+            }
+        )
+    return chunks
+
+
+@MCP.tool()
+def wiki_context_pack(
+    query: str,
+    profile_id: str | None = None,
+    k: int = 5,
+    excerpt_budget_chars: int = 1800,
+    max_chunks_per_page: int = 8,
+    format: str = "json",
+) -> dict[str, Any]:
+    """Build bounded query-local context from published Markdown pages."""
+    if excerpt_budget_chars < 1 or max_chunks_per_page < 1 or format not in {"json", "markdown"}:
+        raise ValueError("budgets must be positive and format must be json or markdown")
+    hits = wiki_search(query, profile_id=profile_id, k=k)["hits"]
+    pages: list[dict[str, Any]] = []
+    for hit in hits:
+        read = wiki_read(str(hit["path"]), "markdown")
+        body = _markdown_body(str(read["content"]))
+        excerpt, _ = _localized_window(body, query, max(1, excerpt_budget_chars // 2))
+        section_index = read["metadata"].get("section_index") or []
+        sources = read["metadata"].get("sources") or []
+        chunks = _localized_chunks(
+            body,
+            query,
+            hit,
+            section_index,
+            max(excerpt_budget_chars - len(excerpt), 0),
+            max_chunks_per_page,
+            sources,
+        )
+        used = len(excerpt) + sum(len(chunk["excerpt"]) for chunk in chunks)
+        pages.append(
+            {
+                **hit,
+                "sources": sources,
+                "excerpt": excerpt,
+                "excerpt_hash": _sha256(excerpt)[:16],
+                "excerpt_budget_chars": excerpt_budget_chars,
+                "excerpt_chars_used": used,
+                "max_chunks": max_chunks_per_page,
+                "truncated": used < len(body) or len(chunks) < len(section_index),
+                "section_index": [
+                    section for section in section_index if section.get("section_id") in {chunk["section_id"] for chunk in chunks}
+                ],
+                "chunks": chunks,
+            }
+        )
+    return {
+        "schema": "llm-wiki-context-pack-v1",
+        "generated_at": str(MANIFEST.get("generated_at") or ""),
+        "root": "snapshot" if MODE == "snapshot" else str(DATA_ROOT),
+        "query": query,
+        "retrieval_mode": "deterministic-file-first",
+        "options": {
+            "limit": k,
+            "max_chars_per_page": excerpt_budget_chars,
+            "max_chunks_per_page": max_chunks_per_page,
+            "expand_links": True,
+            "profile_id": profile_id,
+            "include_unprofiled": False,
+        },
+        "miss": not pages,
+        "seed_pages": [str(page["path"]) for page in pages if page["match_type"] == "seed"],
+        "context_pages": [str(page["path"]) for page in pages if page["match_type"] == "context"],
+        "pages": pages,
+    }
+
+
+@MCP.tool()
+def wiki_quality_report(profile_id: str | None = None) -> dict[str, Any]:
+    """Return generated validation, retrieval, freshness, and readiness status."""
+    quality = _json(_confined(BUNDLE_ROOT, "quality.json"))
+    if profile_id:
+        quality = dict(quality)
+        quality["profile_quality"] = [
+            item for item in quality.get("profile_quality", []) if item.get("profile_id") == profile_id
+        ]
+    return quality
+
+
+@MCP.resource("llm-wiki://manifest")
+def manifest_resource() -> str:
+    return (BUNDLE_ROOT / "manifest.json").read_text(encoding="utf-8")
+
+
+@MCP.resource("llm-wiki://index")
+def index_resource() -> str:
+    return _confined(DATA_ROOT, "index.md").read_text(encoding="utf-8")
+
+
+@MCP.resource("llm-wiki://quality")
+def quality_resource() -> str:
+    return (BUNDLE_ROOT / "quality.json").read_text(encoding="utf-8")
+
+
+@MCP.resource("llm-wiki://page/{identifier}")
+def page_resource(identifier: str) -> str:
+    return str(wiki_read(identifier, "markdown")["content"])
+
+
+if __name__ == "__main__":
+    MCP.run(transport="stdio")

@@ -13,17 +13,52 @@ sys.dont_write_bytecode = True
 
 from wiki_lib import (
     RETRIEVAL_MODE,
+    chunk_payloads,
+    expanded_query_terms,
     excerpt_text,
+    load_glossary,
     read_wiki_page,
     retrieve,
+    section_index,
+    short_text_hash,
     slugify,
+    tokenize,
     utc_now,
     write_report,
 )
 
 
-def page_payload(root: Path, hit: dict[str, Any], max_chars: int) -> dict[str, Any]:
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
+
+
+def page_payload(
+    root: Path,
+    hit: dict[str, Any],
+    max_chars: int,
+    max_chunks: int,
+    query_terms: list[str],
+) -> dict[str, Any]:
     metadata, body = read_wiki_page(root, str(hit["path"]))
+    page_budget = max(1, max_chars // 2)
+    excerpt = excerpt_text(body, page_budget)
+    chunk_budget = max(max_chars - len(excerpt), 0)
+    chunks = chunk_payloads(
+        body,
+        str(hit["path"]),
+        max_chars=chunk_budget,
+        max_chunks=max_chunks,
+        metadata=metadata,
+        hit=hit,
+        query_terms=query_terms,
+    )
+    excerpt_chars_used = len(excerpt) + sum(len(chunk["excerpt"]) for chunk in chunks)
+    all_sections = section_index(body, str(hit["path"]))
+    selected_section_ids = {str(chunk["section_id"]) for chunk in chunks}
+    sections = [section for section in all_sections if str(section["section_id"]) in selected_section_ids]
     return {
         "path": hit["path"],
         "title": hit.get("title", hit["path"]),
@@ -38,7 +73,14 @@ def page_payload(root: Path, hit: dict[str, Any], max_chars: int) -> dict[str, A
         "seed": bool(hit.get("seed", False)),
         "reasons": hit.get("reasons", []),
         "reason_counts": hit.get("reason_counts", {}),
-        "excerpt": excerpt_text(body, max_chars),
+        "excerpt": excerpt,
+        "excerpt_hash": short_text_hash(excerpt),
+        "excerpt_budget_chars": max_chars,
+        "excerpt_chars_used": excerpt_chars_used,
+        "max_chunks": max_chunks,
+        "truncated": excerpt != body.strip() or len(sections) < len(all_sections),
+        "section_index": sections,
+        "chunks": chunks,
     }
 
 
@@ -48,10 +90,17 @@ def build_context_pack(
     *,
     limit: int = 5,
     max_chars_per_page: int = 1800,
+    max_chunks_per_page: int = 8,
     expand_links: bool = True,
     profile: str | None = None,
     include_unprofiled: bool = False,
 ) -> dict[str, Any]:
+    if limit <= 0:
+        raise ValueError("limit must be a positive integer")
+    if max_chars_per_page <= 0:
+        raise ValueError("max_chars_per_page must be a positive integer")
+    if max_chunks_per_page <= 0:
+        raise ValueError("max_chunks_per_page must be a positive integer")
     hits = retrieve(
         root,
         query,
@@ -60,7 +109,9 @@ def build_context_pack(
         profile=profile,
         include_unprofiled=include_unprofiled,
     )
-    pages = [page_payload(root, hit, max_chars_per_page) for hit in hits]
+    glossary, _ = load_glossary(root)
+    query_terms, _ = expanded_query_terms(tokenize(query), glossary)
+    pages = [page_payload(root, hit, max_chars_per_page, max_chunks_per_page, query_terms) for hit in hits]
     return {
         "schema": "llm-wiki-context-pack-v1",
         "generated_at": utc_now(),
@@ -70,6 +121,7 @@ def build_context_pack(
         "options": {
             "limit": limit,
             "max_chars_per_page": max_chars_per_page,
+            "max_chunks_per_page": max_chunks_per_page,
             "expand_links": expand_links,
             "profile_id": profile,
             "include_unprofiled": include_unprofiled,
@@ -128,6 +180,9 @@ def markdown_context_pack(pack: dict[str, Any]) -> str:
                 f"- Profiles: {', '.join(page['profiles']) if page['profiles'] else 'none'}",
                 f"- Sources: {', '.join(f'`{source}`' for source in page['sources']) if page['sources'] else 'none'}",
                 f"- Reasons: {', '.join(page['reasons']) if page['reasons'] else 'none'}",
+                f"- Excerpt Hash: `{page.get('excerpt_hash', '')}`",
+                f"- Excerpt Budget: `{page.get('excerpt_chars_used', 0)}/{page.get('excerpt_budget_chars', 0)}`",
+                f"- Truncated: `{str(bool(page.get('truncated', False))).lower()}`",
                 "",
                 "#### Summary",
                 "",
@@ -140,6 +195,31 @@ def markdown_context_pack(pack: dict[str, Any]) -> str:
                 "```",
             ]
         )
+        chunks = page.get("chunks") or []
+        if chunks:
+            lines.extend(["", "#### Chunks"])
+            for chunk in chunks:
+                chunk_flags = []
+                if chunk.get("confidence") in {"low", "unknown"}:
+                    chunk_flags.append(f"confidence={chunk.get('confidence')}")
+                if chunk.get("contested"):
+                    chunk_flags.append("contested=true")
+                chunk_flag_text = f" ({', '.join(chunk_flags)})" if chunk_flags else ""
+                lines.extend(
+                    [
+                        "",
+                        f"- Chunk: `{chunk['chunk_id']}`{chunk_flag_text}",
+                        f"  - Section: `{chunk['section_id']}`",
+                        f"  - Heading Path: {' > '.join(chunk.get('heading_path', []))}",
+                        f"  - Offsets: {chunk.get('char_start')}..{chunk.get('char_end')}",
+                        f"  - Excerpt Hash: `{chunk.get('excerpt_hash')}`",
+                        "  - Excerpt:",
+                        "",
+                        "```markdown",
+                        chunk.get("excerpt", ""),
+                        "```",
+                    ]
+                )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -147,8 +227,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("wiki_root", help="Target wiki directory")
     parser.add_argument("query", help="Query or task text")
-    parser.add_argument("--limit", type=int, default=5, help="Maximum retrieval hits")
-    parser.add_argument("--max-chars-per-page", type=int, default=1800, help="Excerpt budget per page")
+    parser.add_argument("--limit", type=positive_int, default=5, help="Maximum retrieval hits")
+    parser.add_argument(
+        "--max-chars-per-page",
+        type=positive_int,
+        default=1800,
+        help="Aggregate page and chunk excerpt budget per page",
+    )
+    parser.add_argument("--max-chunks-per-page", type=positive_int, default=8, help="Maximum localized chunks per page")
     parser.add_argument("--no-expand", action="store_true", help="Disable one-hop link expansion")
     parser.add_argument("--profile", help="Filter retrieval to pages declaring this extraction profile")
     parser.add_argument(
@@ -170,6 +256,7 @@ def main() -> int:
             args.query,
             limit=args.limit,
             max_chars_per_page=args.max_chars_per_page,
+            max_chunks_per_page=args.max_chunks_per_page,
             expand_links=not args.no_expand,
             profile=args.profile,
             include_unprofiled=args.include_unprofiled,

@@ -36,6 +36,7 @@ from wiki_lib import (
     read_jsonl,
     relpath,
     write_report,
+    validate_delivery_contract_data,
 )
 
 
@@ -278,7 +279,11 @@ def validate_json_artifacts(root: Path) -> tuple[list[str], list[str]]:
     if not graph_error and (not isinstance(link_graph, dict) or not isinstance(link_graph.get("links"), list)):
         errors.append("link-graph.json must be an object with links list")
     if not errors:
-        expected_index, expected_graph = build_memory_artifacts(root)
+        try:
+            expected_index, expected_graph = build_memory_artifacts(root)
+        except ValueError as exc:
+            errors.append(str(exc))
+            return errors, warnings
         current_paths = sorted(page.get("path") for page in memory_index.get("pages", []) if isinstance(page, dict))
         expected_paths = sorted(page.get("path") for page in expected_index.get("pages", []))
         if current_paths != expected_paths:
@@ -294,6 +299,16 @@ def validate_json_artifacts(root: Path) -> tuple[list[str], list[str]]:
     return errors, warnings
 
 
+def validate_delivery_contract(root: Path) -> tuple[list[str], list[str]]:
+    path = root / "delivery-contract.json"
+    if not path.exists():
+        return [], ["delivery-contract.json is missing; confirm the final publication form before release"]
+    data, error = load_json(path, {})
+    if error:
+        return [f"delivery-contract.json invalid JSON: {error}"], []
+    return [f"delivery-contract.json: {item}" for item in validate_delivery_contract_data(data)], []
+
+
 def validate_wiki(root: Path) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
@@ -307,7 +322,11 @@ def validate_wiki(root: Path) -> dict[str, Any]:
         if not (root / rel).exists():
             errors.append(f"missing required directory: {rel}/")
 
-    page_paths = iter_wiki_pages(root)
+    try:
+        page_paths = iter_wiki_pages(root)
+    except ValueError as exc:
+        errors.append(str(exc))
+        page_paths = []
     for page in page_paths:
         page_errors, page_warnings = validate_page(page, root, profiles, profile_enabled)
         errors.extend(page_errors)
@@ -326,7 +345,16 @@ def validate_wiki(root: Path) -> dict[str, Any]:
     query_errors, query_warnings = validate_query_log(root, profiles)
     provenance_errors, provenance_warnings = validate_source_provenance(root)
     glossary_errors, glossary_warnings = validate_glossary(root)
-    errors.extend(json_errors + profile_state_errors + eval_errors + query_errors + provenance_errors + glossary_errors)
+    delivery_errors, delivery_warnings = validate_delivery_contract(root)
+    errors.extend(
+        json_errors
+        + profile_state_errors
+        + eval_errors
+        + query_errors
+        + provenance_errors
+        + glossary_errors
+        + delivery_errors
+    )
     warnings.extend(
         json_warnings
         + profile_state_warnings
@@ -334,6 +362,7 @@ def validate_wiki(root: Path) -> dict[str, Any]:
         + query_warnings
         + provenance_warnings
         + glossary_warnings
+        + delivery_warnings
     )
 
     return {

@@ -15,7 +15,7 @@ from health_check import check_health
 from build_context_pack import build_context_pack, markdown_context_pack
 from init_wiki import init_wiki
 from publish_mcp_bundle import confined_path, publish_mcp_bundle
-from publish_semantic_html import publish_html
+from publish_semantic_html import html_page_name, publish_html
 from validate_wiki import validate_wiki
 from wiki_lib import build_memory_artifacts, retrieve, source_body_hash, tokenize, write_json
 
@@ -219,6 +219,19 @@ A retrieval contract defines seed hits, expected misses, and context expansion.
 ## Links
 
 - [[Context Expansion]]
+
+## Evidence Table
+
+| Signal | Meaning |
+| --- | --- |
+| seed | Primary retrieval evidence |
+| context | One-hop supporting page |
+
+> Preserve uncertainty when evidence is low confidence or contested.
+
+```text
+require_seed_hit=true
+```
 """,
         encoding="utf-8",
     )
@@ -239,8 +252,8 @@ tags: [retrieval]
 sources: [raw/articles/transformer-memory-source.md]
 profiles: [core]
 extraction_goal: retrieval context coverage
-confidence: medium
-contested: false
+confidence: low
+contested: true
 ---
 
 # Context Expansion
@@ -587,8 +600,44 @@ def main() -> int:
             print("error: context pack pages lack sources or excerpts")
             print(json.dumps(context_pack, indent=2, ensure_ascii=False))
             return 1
+        if not all(page.get("chunks") for page in context_pack["pages"]):
+            print("error: context pack pages lack localized chunks")
+            print(json.dumps(context_pack, indent=2, ensure_ascii=False))
+            return 1
+        repeat_context_pack = build_context_pack(root, "seed expected misses", limit=5, profile="core", max_chars_per_page=60)
+        first_chunks = [
+            (chunk["chunk_id"], chunk["excerpt_hash"])
+            for page in context_pack["pages"]
+            for chunk in page.get("chunks", [])
+        ]
+        repeat_chunks = [
+            (chunk["chunk_id"], chunk["excerpt_hash"])
+            for page in repeat_context_pack["pages"]
+            for chunk in page.get("chunks", [])
+        ]
+        if first_chunks != repeat_chunks:
+            print("error: context pack chunk ids or hashes are not deterministic")
+            print(json.dumps({"first": first_chunks, "repeat": repeat_chunks}, indent=2, ensure_ascii=False))
+            return 1
+        context_page = next(page for page in context_pack["pages"] if page["path"] == "wiki/concepts/context-expansion.md")
+        context_chunk = context_page["chunks"][0]
+        if (
+            not context_chunk.get("chunk_id")
+            or not context_chunk.get("section_id")
+            or not context_chunk.get("heading_path")
+            or context_chunk.get("excerpt_hash") != repeat_context_pack["pages"][context_pack["pages"].index(context_page)]["chunks"][0].get("excerpt_hash")
+            or context_chunk.get("confidence") != "low"
+            or context_chunk.get("contested") is not True
+        ):
+            print("error: context chunk did not expose stable localization or uncertainty")
+            print(json.dumps(context_chunk, indent=2, ensure_ascii=False))
+            return 1
         if "[excerpt truncated]" not in markdown_context_pack(context_pack):
             print("error: context pack markdown did not show bounded excerpt truncation")
+            print(markdown_context_pack(context_pack))
+            return 1
+        if "#### Chunks" not in markdown_context_pack(context_pack) or "Excerpt Hash" not in markdown_context_pack(context_pack):
+            print("error: context pack markdown did not expose chunk localization")
             print(markdown_context_pack(context_pack))
             return 1
 
@@ -626,19 +675,48 @@ def main() -> int:
             print(json.dumps(html_manifest, indent=2, ensure_ascii=False))
             return 1
         index_html = root / "reports" / "publish" / "html" / "index.html"
-        contract_html = root / "reports" / "publish" / "html" / "pages" / "wiki-concepts-retrieval-contract.html"
+        contract_html = (
+            root
+            / "reports"
+            / "publish"
+            / "html"
+            / "pages"
+            / html_page_name("wiki/concepts/retrieval-contract.md")
+        )
         if not index_html.exists() or not contract_html.exists():
             print("error: semantic HTML publish did not create expected files")
             print(json.dumps(html_manifest, indent=2, ensure_ascii=False))
             return 1
         contract_text = contract_html.read_text(encoding="utf-8")
-        if "<article" not in contract_text or "data-confidence=\"medium\"" not in contract_text:
+        if "<article" not in contract_text or "data-page-path=\"wiki/concepts/retrieval-contract.md\"" not in contract_text:
             print("error: semantic HTML page lacks article metadata")
             print(contract_text)
             return 1
-        if "<section data-role=\"body\">" not in contract_text or "<h1>Retrieval Contract</h1>" not in contract_text:
-            print("error: semantic HTML page lacks body section or heading")
+        if (
+            "id=\"llm-wiki-page-metadata\"" not in contract_text
+            or "<section data-role=\"body\"" not in contract_text
+            or "data-section-id=" not in contract_text
+            or "data-heading-path=\"Retrieval Contract" not in contract_text
+            or "<h1 id=\"retrieval-contract-" not in contract_text
+        ):
+            print("error: semantic HTML page lacks body section, metadata script, or stable anchors")
             print(contract_text)
+            return 1
+        if "<thead>" not in contract_text or "<tbody>" not in contract_text:
+            print("error: semantic HTML table lacks thead/tbody semantics")
+            print(contract_text)
+            return 1
+        if "<blockquote>" not in contract_text or "<pre><code>" not in contract_text:
+            print("error: semantic HTML did not preserve blockquote or code block")
+            print(contract_text)
+            return 1
+        html_manifest_json = json.loads((root / "reports" / "publish" / "html" / "manifest.json").read_text(encoding="utf-8"))
+        contract_detail = next(
+            item for item in html_manifest_json.get("page_details", []) if item.get("path") == "wiki/concepts/retrieval-contract.md"
+        )
+        if not contract_detail.get("sections") or contract_detail.get("section_count", 0) < 3:
+            print("error: semantic HTML manifest lacks section details")
+            print(json.dumps(contract_detail, indent=2, ensure_ascii=False))
             return 1
         if "wiki/concepts/retrieval-contract.md" not in index_html.read_text(encoding="utf-8"):
             print("error: semantic HTML index lacks source path metadata")
@@ -694,11 +772,31 @@ def main() -> int:
 
         mcp_manifest = publish_mcp_bundle(root, mode="linked", clean=True)
         mcp_root = root / "reports" / "publish" / "mcp"
-        for rel in ("manifest.json", "resources.json", "tools.json", "prompts.json", "quality.json", "server-config.json", "README.md"):
+        for rel in (
+            "manifest.json",
+            "resources.json",
+            "tools.json",
+            "prompts.json",
+            "quality.json",
+            "server-config.json",
+            "server.py",
+            "requirements.txt",
+            "schemas/manifest.json",
+            "schemas/context-pack.schema.json",
+            "schemas/mcp-tools.schema.json",
+            "schemas/quality.schema.json",
+            "schemas/html-manifest.schema.json",
+            "schemas/section-chunk.schema.json",
+            "README.md",
+        ):
             if not (mcp_root / rel).exists():
                 print(f"error: MCP bundle did not create {rel}")
                 print(json.dumps(mcp_manifest, indent=2, ensure_ascii=False))
                 return 1
+        generated_skills = list((mcp_root / "skills").glob("*/SKILL.md"))
+        if len(generated_skills) != 1 or not (generated_skills[0].parent / "agents" / "openai.yaml").is_file():
+            print("error: MCP bundle did not create one installable wiki-specific companion Skill")
+            return 1
         if mcp_manifest.get("schema") != "llm-wiki-mcp-publish-v1" or mcp_manifest.get("contract_status") != "pass":
             print("error: MCP manifest schema or contract status mismatch")
             print(json.dumps(mcp_manifest, indent=2, ensure_ascii=False))
@@ -708,10 +806,30 @@ def main() -> int:
             print("error: MCP quality report did not pass after passing retrieval evals")
             print(json.dumps(mcp_quality, indent=2, ensure_ascii=False))
             return 1
+        if mcp_quality.get("readiness_level") not in {"ready", "degraded"} or mcp_quality.get("unsafe_to_answer") is not False:
+            print("error: MCP quality report lacks usable agent readiness")
+            print(json.dumps(mcp_quality, indent=2, ensure_ascii=False))
+            return 1
+        if "agent_use_recommendation" not in mcp_quality or "profile_quality" not in mcp_quality:
+            print("error: MCP quality report lacks recommendation or profile summaries")
+            print(json.dumps(mcp_quality, indent=2, ensure_ascii=False))
+            return 1
         mcp_resources = json.loads((mcp_root / "resources.json").read_text(encoding="utf-8"))
         if not any(item.get("uri") == "llm-wiki://quality" for item in mcp_resources.get("resources", [])):
             print("error: MCP resources did not expose quality resource")
             print(json.dumps(mcp_resources, indent=2, ensure_ascii=False))
+            return 1
+        if not any(item.get("uri") == "llm-wiki://schemas" for item in mcp_resources.get("resources", [])):
+            print("error: MCP resources did not expose schema manifest resource")
+            print(json.dumps(mcp_resources, indent=2, ensure_ascii=False))
+            return 1
+        context_resource_id = f"page-md-{Path(html_page_name('wiki/concepts/context-expansion.md')).stem}"
+        context_resource = next(
+            item for item in mcp_resources.get("resources", []) if item.get("id") == context_resource_id
+        )
+        if context_resource.get("confidence") != "low" or context_resource.get("contested") is not True:
+            print("error: MCP page resources did not propagate uncertainty metadata")
+            print(json.dumps(context_resource, indent=2, ensure_ascii=False))
             return 1
         mcp_tools = json.loads((mcp_root / "tools.json").read_text(encoding="utf-8"))
         tool_names = {tool.get("name") for tool in mcp_tools.get("tools", [])}
@@ -719,9 +837,42 @@ def main() -> int:
             print("error: MCP tools contract missing required tools")
             print(json.dumps(mcp_tools, indent=2, ensure_ascii=False))
             return 1
+        context_tool = next(tool for tool in mcp_tools["tools"] if tool.get("name") == "wiki_context_pack")
+        context_props = context_tool["output_schema"]["properties"]
+        page_props = context_props["pages"]["items"]["properties"]
+        if "budget" in context_props or "root" not in context_props or "options" not in context_props or "chunks" not in page_props:
+            print("error: MCP context pack schema is stale or lacks chunks")
+            print(json.dumps(context_tool, indent=2, ensure_ascii=False))
+            return 1
+        read_tool = next(tool for tool in mcp_tools["tools"] if tool.get("name") == "wiki_read")
+        read_props = read_tool["output_schema"]["properties"]
+        if not {"content_hash", "canonical", "generated", "metadata"} <= set(read_props):
+            print("error: MCP read schema lacks audit metadata")
+            print(json.dumps(read_tool, indent=2, ensure_ascii=False))
+            return 1
+        schema_manifest = json.loads((mcp_root / "schemas" / "manifest.json").read_text(encoding="utf-8"))
+        schema_paths = {item.get("path") for item in schema_manifest.get("schemas", [])}
+        required_schema_paths = {
+            "schemas/context-pack.schema.json",
+            "schemas/mcp-tools.schema.json",
+            "schemas/quality.schema.json",
+            "schemas/html-manifest.schema.json",
+            "schemas/section-chunk.schema.json",
+        }
+        if not required_schema_paths <= schema_paths:
+            print("error: MCP schema manifest lacks required generated schemas")
+            print(json.dumps(schema_manifest, indent=2, ensure_ascii=False))
+            return 1
+        if json.loads((mcp_root / "schemas" / "context-pack.schema.json").read_text(encoding="utf-8")).get("type") != "object":
+            print("error: context pack generated schema is not an object schema")
+            return 1
         mcp_config = json.loads((mcp_root / "server-config.json").read_text(encoding="utf-8"))
-        if mcp_config.get("status") != "contract-only" or mcp_config.get("policy", {}).get("read_only") is not True:
-            print("error: MCP server config did not declare contract-only read-only policy")
+        if (
+            mcp_config.get("status") != "executable"
+            or mcp_config.get("adapter", {}).get("implemented") is not True
+            or mcp_config.get("policy", {}).get("read_only") is not True
+        ):
+            print("error: MCP server config did not declare executable read-only policy")
             print(json.dumps(mcp_config, indent=2, ensure_ascii=False))
             return 1
         linked_page_resources = [
@@ -806,6 +957,12 @@ def main() -> int:
             print("error: min_score failure was not enforced")
             print(min_score_result.stdout)
             return 1
+        publish_mcp_bundle(root, mode="linked", clean=True)
+        unsafe_quality = json.loads((root / "reports" / "publish" / "mcp" / "quality.json").read_text(encoding="utf-8"))
+        if unsafe_quality.get("readiness_level") != "unsafe" or unsafe_quality.get("unsafe_to_answer") is not True:
+            print("error: MCP quality did not become unsafe after retrieval eval failure")
+            print(json.dumps(unsafe_quality, indent=2, ensure_ascii=False))
+            return 1
         prepare_wiki(root)
 
         health = check_health(root)
@@ -834,6 +991,11 @@ def main() -> int:
             return 1
         bad_glossary.unlink()
 
+        passing_eval_text = "\n".join(
+            line for line in (root / "retrieval-evals.jsonl").read_text(encoding="utf-8").splitlines()
+            if "context-only-rejected" not in line
+        )
+        (root / "retrieval-evals.jsonl").write_text(passing_eval_text + "\n", encoding="utf-8")
         stale_page = root / "wiki" / "concepts" / "transformer-memory.md"
         stale_page.write_text(stale_page.read_text(encoding="utf-8") + "\nAdditional retrieval-relevant text.\n", encoding="utf-8")
         stale_validation = validate_wiki(root)
@@ -846,6 +1008,10 @@ def main() -> int:
         stale_status = stale_quality.get("freshness", {}).get("memory-index.json", {}).get("status")
         if stale_status != "stale":
             print("error: MCP quality report did not surface stale memory index")
+            print(json.dumps({"manifest": stale_mcp_manifest, "quality": stale_quality}, indent=2, ensure_ascii=False))
+            return 1
+        if stale_quality.get("readiness_level") != "degraded" or stale_quality.get("unsafe_to_answer") is not False:
+            print("error: MCP quality report did not downgrade stale generated artifacts to degraded")
             print(json.dumps({"manifest": stale_mcp_manifest, "quality": stale_quality}, indent=2, ensure_ascii=False))
             return 1
         stale_strict = run_command([sys.executable, str(SCRIPT_DIR / "validate_wiki.py"), str(root), "--strict"])

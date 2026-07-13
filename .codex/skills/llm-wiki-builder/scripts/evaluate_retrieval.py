@@ -15,6 +15,13 @@ sys.dont_write_bytecode = True
 from wiki_lib import load_profiles, page_matches_identifier, read_jsonl, retrieve, write_report
 
 
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
+
+
 def first_matching_rank(hits: list[dict[str, Any]], identifier: str) -> int | None:
     for index, hit in enumerate(hits, start=1):
         if page_matches_identifier(hit, identifier):
@@ -175,7 +182,7 @@ def profile_gate_failures(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("wiki_root", help="Target wiki directory")
-    parser.add_argument("--limit", type=int, default=5, help="Maximum number of hits per eval case")
+    parser.add_argument("--limit", type=positive_int, default=5, help="Maximum number of hits per eval case")
     parser.add_argument("--json", action="store_true", help="Print JSON result")
     parser.add_argument("--no-report", action="store_true", help="Do not write reports/retrieval output")
     return parser

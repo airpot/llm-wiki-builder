@@ -19,6 +19,7 @@ Validate:
 - index coverage for compiled pages;
 - memory index and link graph freshness, including content drift after page edits;
 - local source path existence and optional raw body hash provenance;
+- canonical page real-path confinement under `wiki/`;
 - retrieval eval schema, including optional `profile_id`, `expect_miss`, `require_seed_hit`, `allow_forbidden_context`, and `min_score`.
 
 Run `scripts/health_check.py` for zero-LLM structural preflight. It reports empty/stub pages, broken Markdown links, broken wikilinks, orphan pages, index completeness, log coverage, tag taxonomy drift, page size warnings, unprofiled pages, profiles with no pages, profiles with no eval cases, missing profile-required sections, profile-specific query misses, glossary issues, and mixed-language eval coverage gaps without applying fixes.
@@ -33,9 +34,17 @@ Run `scripts/publish_mcp_bundle.py` when publishing a wiki for agent systems. Th
 - health-check status, findings, and blocker counts;
 - retrieval eval metrics and profile gate failures when eval cases exist;
 - freshness status for `memory-index.json`, `link-graph.json`, and semantic HTML;
+- `readiness_level` as `ready`, `degraded`, or `unsafe`;
+- `unsafe_to_answer`, `agent_use_recommendation`, `blocking_reasons`, `stale_artifacts`, and per-profile quality summaries;
 - raw-source exclusion and read-only/path-confined publication policy.
 
-The first MCP publish target is contract-only and read-only. Do not add MCP write tools, remote HTTP/auth, raw-source publication, external models, embeddings, vector stores, crawlers, or non-standard-library runtime dependencies as part of safe fixes or optimization.
+Treat `unsafe` as a hard agent-answering stop: validation errors, health errors, contract failures, missing required publish artifacts, or failing retrieval evals require repair before relying on the wiki. Treat `degraded` as usable with caution: stale generated artifacts, skipped evals, validation warnings, retrieval/readability warnings, weak profile coverage, or missing mixed-language eval coverage require uncertainty-preserving answers and gap reporting. `ready` means no blocking or material degradation findings are present.
+
+The default MCP publish target is executable, local stdio, snapshot-based, and read-only, with a thin companion Skill. Do not add MCP write tools, remote HTTP/auth, raw-source publication, external models, embeddings, vector stores, or crawlers. Keep the MCP SDK dependency confined to generated application output.
+
+Snapshot publication is allowlist-based. Treat an external canonical-page symlink, any symbolic link in a copied snapshot tree, a generated HTML name collision, or an active HTML link scheme as a blocking publication error. Snapshot publication must regenerate clean HTML and must not copy query logs, operational logs, retrieval eval history, prior context packs, stale pages, or source-host absolute roots.
+
+Treat duplicate normalized titles, slugs, or aliases as blocking identifier collisions. Rewrite local Markdown fragments to actual generated heading IDs; unresolved fragments are diagnostics, not pass-through links. Scan the complete snapshot bundle for original query text and absolute host paths, not only top-level manifests.
 
 ## Agent-Mediated Safe-Fix Mode
 

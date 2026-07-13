@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 
-from wiki_lib import append_log, build_memory_artifacts, write_json
+from wiki_lib import append_log, build_memory_artifacts, confined_output_path, write_json
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,9 +27,16 @@ def main() -> int:
     memory_index, link_graph = build_memory_artifacts(root)
 
     if args.write:
-        write_json(root / "memory-index.json", memory_index)
-        write_json(root / "link-graph.json", link_graph)
-        append_log(root, "rebuilt memory-index.json and link-graph.json.")
+        try:
+            confined_output_path(root, root / "memory-index.json", scope="wiki root")
+            confined_output_path(root, root / "link-graph.json", scope="wiki root")
+            confined_output_path(root, root / "log.md", scope="wiki root")
+            write_json(root / "memory-index.json", memory_index)
+            write_json(root / "link-graph.json", link_graph)
+            append_log(root, "rebuilt memory-index.json and link-graph.json.")
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
 
     if args.json:
         print(json.dumps({"memory_index": memory_index, "link_graph": link_graph}, ensure_ascii=False, indent=2))

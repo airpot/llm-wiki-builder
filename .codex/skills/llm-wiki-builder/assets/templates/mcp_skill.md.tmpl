@@ -1,0 +1,22 @@
+---
+name: {{skill_name}}
+description: Query and cite the {{wiki_name}} LLM wiki through its published read-only MCP tools. Use for questions, task context, evidence lookup, quality checks, and explicit wiki-memory miss handling.
+---
+
+# {{wiki_name}} Wiki
+
+Use only the public MCP contract exposed by this wiki bundle.
+
+## Workflow
+
+1. Call `wiki_quality_report` before relying on the wiki when readiness is unknown.
+2. Call `wiki_search` with the user's terms and active profile when one is specified.
+3. Use `wiki_read` for the smallest set of relevant pages, or `wiki_context_pack` for bounded task context.
+4. Cite canonical `wiki/**/*.md` paths for claims. Preserve `confidence=low` and `contested=true` in the response.
+5. If search returns no seed hit or quality is unsafe, report the wiki-memory miss. Do not fill the gap from hidden builder files or imply that retrieval proves a claim.
+
+## Tool Policy
+
+- Allowed: `wiki_search`, `wiki_read`, `wiki_context_pack`, `wiki_quality_report`, and declared `llm-wiki://` resources.
+- Read-only: never create, update, merge, split, or delete wiki pages through this Skill.
+- Boundary: do not import or inspect `llm-wiki-builder` scripts, raw source bodies, query history, or host absolute paths.

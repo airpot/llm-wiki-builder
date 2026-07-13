@@ -12,7 +12,8 @@ import unicodedata
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from urllib.parse import urlsplit
 
 sys.dont_write_bytecode = True
 
@@ -48,6 +49,11 @@ REQUIRED_DIRS = [
 PROFILE_DIR = "profiles"
 PROFILE_SCHEMA = "llm-wiki-extraction-profile-v1"
 GLOSSARY_SCHEMA = "llm-wiki-glossary-v1"
+DELIVERY_CONTRACT_SCHEMA = "llm-wiki-delivery-contract-v1"
+DELIVERY_PUBLISH_TARGETS = {"markdown", "html", "mcp", "mcp-skill"}
+DELIVERY_MCP_RUNTIMES = {"executable", "contract-only"}
+DELIVERY_PUBLICATION_MODES = {"linked", "snapshot"}
+DELIVERY_UPDATE_STRATEGIES = {"rebuild-on-change", "manual"}
 CORE_DIRECTION_FIELDS = [
     "purpose",
     "primary_users",
@@ -118,6 +124,24 @@ REQUIRED_FRONTMATTER = [
 PAGE_TYPES = {"concept", "entity", "comparison", "query", "note", "source-summary"}
 CONFIDENCE_VALUES = {"high", "medium", "low", "unknown"}
 RETRIEVAL_MODE = "deterministic-file-first"
+EXCERPT_TRUNCATION_MARKER = "\n\n[excerpt truncated]"
+SAFE_HTML_LINK_SCHEMES = {"http", "https", "mailto"}
+
+DEFAULT_DELIVERY_CONTRACT: dict[str, Any] = {
+    "schema": DELIVERY_CONTRACT_SCHEMA,
+    "publish_target": "mcp-skill",
+    "consumer_hosts": ["codex"],
+    "mcp_runtime": "executable",
+    "transport": "stdio",
+    "publication_mode": "snapshot",
+    "privacy": {
+        "include_raw_sources": False,
+        "include_query_history": False,
+        "include_absolute_paths": False,
+    },
+    "update_strategy": "rebuild-on-change",
+    "skill_targets": ["codex"],
+}
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
@@ -159,6 +183,46 @@ def relpath(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
 
 
+def confined_source_path(root: Path, path: Path, *, scope: str = "wiki root") -> Path:
+    resolved_root = root.resolve()
+    resolved = path.resolve()
+    if resolved != resolved_root and resolved_root not in resolved.parents:
+        raise ValueError(f"path escapes {scope}: {path}")
+    return resolved
+
+
+def confined_output_path(root: Path, path: Path, *, scope: str = "wiki root") -> Path:
+    """Reject generated paths whose lexical or existing real parents escape root."""
+    resolved_root = root.resolve()
+    candidate = path if path.is_absolute() else root / path
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"generated path escapes {scope}: {path}") from exc
+    current = resolved_root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"generated path contains symbolic link: {current}")
+        if current.exists():
+            resolved = current.resolve()
+            if resolved != resolved_root and resolved_root not in resolved.parents:
+                raise ValueError(f"generated path escapes {scope}: {path}")
+    resolved = candidate.resolve()
+    if resolved != resolved_root and resolved_root not in resolved.parents:
+        raise ValueError(f"generated path escapes {scope}: {path}")
+    return resolved
+
+
+def confined_output_tree(root: Path, path: Path, *, scope: str = "wiki root") -> Path:
+    """Reject symbolic links anywhere in an existing generated-output tree."""
+    resolved = confined_output_path(root, path, scope=scope)
+    if path.exists() and path.is_dir():
+        for descendant in sorted(path.rglob("*")):
+            confined_output_path(root, descendant, scope=scope)
+    return resolved
+
+
 def load_json(path: Path, default: Any) -> tuple[Any, str | None]:
     if not path.exists():
         return default, None
@@ -185,6 +249,7 @@ def stable_json(data: Any) -> str:
 
 def append_log(root: Path, message: str) -> None:
     log_path = root / "log.md"
+    confined_output_path(root, log_path, scope="wiki root")
     log_path.parent.mkdir(parents=True, exist_ok=True)
     prefix = "" if log_path.exists() and log_path.read_text(encoding="utf-8").endswith("\n") else "\n"
     with log_path.open("a", encoding="utf-8") as handle:
@@ -232,6 +297,10 @@ def source_body_hash(body: str) -> str:
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
+def short_text_hash(text: str, length: int = 16) -> str:
+    return source_body_hash(text)[:length]
+
+
 def file_body_hash(path: Path) -> tuple[str | None, str | None]:
     try:
         text = path.read_text(encoding="utf-8")
@@ -277,6 +346,44 @@ def validate_core_direction_data(data: Any) -> list[str]:
         else:
             if not isinstance(value, list) or is_placeholder_value(value):
                 errors.append(f"core direction {field} must be a non-empty list")
+    return errors
+
+
+def default_delivery_contract() -> dict[str, Any]:
+    return json.loads(json.dumps(DEFAULT_DELIVERY_CONTRACT))
+
+
+def validate_delivery_contract_data(data: Any) -> list[str]:
+    if not isinstance(data, dict):
+        return ["delivery contract must be a JSON object"]
+    errors: list[str] = []
+    if data.get("schema") != DELIVERY_CONTRACT_SCHEMA:
+        errors.append(f"delivery contract schema must be {DELIVERY_CONTRACT_SCHEMA}")
+    if data.get("publish_target") not in DELIVERY_PUBLISH_TARGETS:
+        errors.append(f"delivery contract publish_target must be one of {sorted(DELIVERY_PUBLISH_TARGETS)}")
+    if data.get("mcp_runtime") not in DELIVERY_MCP_RUNTIMES:
+        errors.append(f"delivery contract mcp_runtime must be one of {sorted(DELIVERY_MCP_RUNTIMES)}")
+    if data.get("transport") != "stdio":
+        errors.append("delivery contract transport must be stdio")
+    if data.get("publication_mode") not in DELIVERY_PUBLICATION_MODES:
+        errors.append(f"delivery contract publication_mode must be one of {sorted(DELIVERY_PUBLICATION_MODES)}")
+    if data.get("update_strategy") not in DELIVERY_UPDATE_STRATEGIES:
+        errors.append(f"delivery contract update_strategy must be one of {sorted(DELIVERY_UPDATE_STRATEGIES)}")
+    for field in ("consumer_hosts", "skill_targets"):
+        value = data.get(field)
+        if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+            errors.append(f"delivery contract {field} must be a string list")
+    privacy = data.get("privacy")
+    if not isinstance(privacy, dict):
+        errors.append("delivery contract privacy must be an object")
+    else:
+        for field in ("include_raw_sources", "include_query_history", "include_absolute_paths"):
+            if not isinstance(privacy.get(field), bool):
+                errors.append(f"delivery contract privacy.{field} must be boolean")
+        if any(privacy.get(field) is True for field in privacy):
+            errors.append("delivery contract default publisher does not support privacy inclusions")
+    if data.get("publish_target") == "mcp-skill" and not data.get("skill_targets"):
+        errors.append("delivery contract mcp-skill target requires at least one skill target")
     return errors
 
 
@@ -560,7 +667,16 @@ def iter_wiki_pages(root: Path) -> list[Path]:
     wiki = root / "wiki"
     if not wiki.exists():
         return []
-    return sorted(path for path in wiki.rglob("*.md") if path.is_file())
+    if wiki.is_symlink():
+        raise ValueError(f"canonical wiki directory must not be a symbolic link: {wiki}")
+    confined_source_path(root, wiki, scope="wiki root")
+    pages: list[Path] = []
+    for path in sorted(wiki.rglob("*.md")):
+        if not path.is_file():
+            continue
+        confined_source_path(wiki, path, scope="canonical wiki directory")
+        pages.append(path)
+    return pages
 
 
 def read_wiki_page(root: Path, page_path: str) -> tuple[dict[str, Any], str]:
@@ -571,17 +687,202 @@ def read_wiki_page(root: Path, page_path: str) -> tuple[dict[str, Any], str]:
 
 def excerpt_text(text: str, max_chars: int) -> str:
     body = text.strip()
-    if max_chars <= 0 or len(body) <= max_chars:
+    if max_chars <= 0:
+        return ""
+    if len(body) <= max_chars:
         return body
-    cutoff = body.rfind("\n\n", 0, max_chars)
-    if cutoff < max_chars // 2:
-        cutoff = body.rfind("\n", 0, max_chars)
-    if cutoff < max_chars // 2:
-        cutoff = max_chars
-    return body[:cutoff].rstrip() + "\n\n[excerpt truncated]"
+    marker = EXCERPT_TRUNCATION_MARKER
+    if max_chars <= len(marker):
+        return body[:max_chars]
+    content_budget = max_chars - len(marker)
+    cutoff = body.rfind("\n\n", 0, content_budget + 1)
+    if cutoff < content_budget // 2:
+        cutoff = body.rfind("\n", 0, content_budget + 1)
+    if cutoff < content_budget // 2:
+        cutoff = content_budget
+    return body[:cutoff].rstrip() + marker
 
 
-def markdown_to_semantic_html(markdown: str) -> str:
+def bounded_excerpt_with_offsets(text: str, start: int, end: int, max_chars: int) -> tuple[str, int]:
+    source = text[start:end]
+    stripped = source.strip()
+    if max_chars <= 0:
+        return "", start
+    if len(stripped) <= max_chars:
+        return stripped, end
+    marker = EXCERPT_TRUNCATION_MARKER
+    if max_chars <= len(marker):
+        excerpt = source[:max_chars]
+        return excerpt, start + len(excerpt)
+    content_budget = max_chars - len(marker)
+    cutoff = source.rfind("\n\n", 0, content_budget + 1)
+    if cutoff < content_budget // 2:
+        cutoff = source.rfind("\n", 0, content_budget + 1)
+    if cutoff < content_budget // 2:
+        cutoff = content_budget
+    excerpt = source[:cutoff].rstrip()
+    return excerpt + marker, start + len(excerpt)
+
+
+def heading_anchor(page_path: str, heading_path: list[str], title: str, occurrence: int) -> str:
+    base = slugify(title) or "section"
+    digest = short_text_hash(f"{page_path}\n{'/'.join(heading_path)}\n{occurrence}\n{title}", 8)
+    return f"{base}-{digest}"
+
+
+def markdown_sections(body: str, page_path: str = "") -> list[dict[str, Any]]:
+    matches = list(HEADING_RE.finditer(body))
+    if not matches:
+        stripped = body.strip()
+        section_id = heading_anchor(page_path, ["Document"], "Document", 1)
+        return [
+            {
+                "section_id": section_id,
+                "heading": "Document",
+                "heading_level": 0,
+                "heading_path": ["Document"],
+                "char_start": 0,
+                "char_end": len(body),
+                "content_hash": short_text_hash(stripped),
+            }
+        ]
+
+    sections: list[dict[str, Any]] = []
+    stack: list[tuple[int, str]] = []
+    occurrences: Counter[tuple[str, ...]] = Counter()
+    for index, match in enumerate(matches):
+        level = len(match.group(1))
+        title = match.group(2).strip()
+        while stack and stack[-1][0] >= level:
+            stack.pop()
+        stack.append((level, title))
+        heading_path = [item[1] for item in stack]
+        occurrence_key = tuple(heading_path)
+        occurrences[occurrence_key] += 1
+        end = len(body)
+        for later in matches[index + 1 :]:
+            if len(later.group(1)) <= level:
+                end = later.start()
+                break
+        section_text = body[match.start() : end].strip()
+        section_id = heading_anchor(page_path, heading_path, title, occurrences[occurrence_key])
+        sections.append(
+            {
+                "section_id": section_id,
+                "heading": title,
+                "heading_level": level,
+                "heading_path": heading_path,
+                "char_start": match.start(),
+                "char_end": end,
+                "content_hash": short_text_hash(section_text),
+            }
+        )
+    return sections
+
+
+def section_index(body: str, page_path: str = "") -> list[dict[str, Any]]:
+    return [
+        {
+            "section_id": section["section_id"],
+            "heading": section["heading"],
+            "heading_level": section["heading_level"],
+            "heading_path": section["heading_path"],
+            "char_start": section["char_start"],
+            "char_end": section["char_end"],
+            "content_hash": section["content_hash"],
+        }
+        for section in markdown_sections(body, page_path)
+    ]
+
+
+def chunk_payloads(
+    body: str,
+    page_path: str,
+    *,
+    max_chars: int,
+    max_chunks: int = 8,
+    metadata: dict[str, Any] | None = None,
+    hit: dict[str, Any] | None = None,
+    query_terms: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    metadata = metadata or {}
+    hit = hit or {}
+    chunks: list[dict[str, Any]] = []
+    remaining = max(max_chars, 0)
+    sections = markdown_sections(body, page_path)
+    terms = [term.lower() for term in (query_terms or []) if term]
+    if terms:
+        ranked: list[tuple[int, int, int, dict[str, Any]]] = []
+        for section in sections:
+            start = int(section["char_start"])
+            end = int(section["char_end"])
+            section_text = body[start:end].lower()
+            heading_text = " ".join(section.get("heading_path", [])).lower()
+            body_matches = sum(section_text.count(term) for term in terms)
+            heading_matches = sum(heading_text.count(term) for term in terms)
+            ranked.append((body_matches, heading_matches, -(end - start), section))
+        selected = [item[3] for item in sorted(ranked, key=lambda item: item[:3], reverse=True)[: max(max_chunks, 0)]]
+        sections = sorted(selected, key=lambda section: int(section["char_start"]))
+    else:
+        sections = sections[: max(max_chunks, 0)]
+    for index, section in enumerate(sections, start=1):
+        if remaining <= 0:
+            break
+        sections_left = len(sections) - index + 1
+        chunk_budget = max(1, remaining // sections_left)
+        excerpt, excerpt_end = bounded_excerpt_with_offsets(
+            body,
+            int(section["char_start"]),
+            int(section["char_end"]),
+            chunk_budget,
+        )
+        if not excerpt:
+            break
+        remaining -= len(excerpt)
+        chunk_id = f"{section['section_id']}-c{index}"
+        chunks.append(
+            {
+                "chunk_id": chunk_id,
+                "path": page_path,
+                "section_id": section["section_id"],
+                "heading": section["heading"],
+                "heading_path": section["heading_path"],
+                "char_start": section["char_start"],
+                "char_end": excerpt_end,
+                "excerpt": excerpt,
+                "excerpt_hash": short_text_hash(excerpt),
+                "content_hash": section["content_hash"],
+                "confidence": str(metadata.get("confidence") or hit.get("confidence") or "unknown"),
+                "contested": bool(metadata.get("contested", hit.get("contested", False))),
+                "sources": normalize_list(metadata.get("sources") or hit.get("sources")),
+                "match_type": hit.get("match_type", "seed"),
+                "score": hit.get("score", 0),
+                "primary_score": hit.get("primary_score", 0),
+                "reasons": hit.get("reasons", []),
+                "reason_counts": hit.get("reason_counts", {}),
+            }
+        )
+    return chunks
+
+
+def safe_html_link_target(target: str) -> str | None:
+    value = target.strip()
+    if not value:
+        return None
+    if value.startswith("//"):
+        return None
+    scheme = urlsplit(value).scheme.lower()
+    if scheme and scheme not in SAFE_HTML_LINK_SCHEMES:
+        return None
+    return value
+
+
+def markdown_to_semantic_html(
+    markdown: str,
+    page_path: str = "",
+    metadata: dict[str, Any] | None = None,
+    link_rewriter: Callable[[str], str | None] | None = None,
+) -> str:
     lines = markdown.splitlines()
     out: list[str] = []
     paragraph: list[str] = []
@@ -592,11 +893,30 @@ def markdown_to_semantic_html(markdown: str) -> str:
     blockquote_lines: list[str] = []
     in_table = False
     table_rows: list[str] = []
+    open_section = False
+    heading_stack: list[tuple[int, str]] = []
+    heading_occurrences: Counter[tuple[str, ...]] = Counter()
+    section_lookup = {
+        int(section["char_start"]): section
+        for section in markdown_sections(markdown, page_path)
+        if int(section.get("heading_level", 0)) > 0
+    }
+    cursor = 0
+    metadata = metadata or {}
 
     def inline(value: str) -> str:
         escaped = html.escape(value)
         escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
-        escaped = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', escaped)
+
+        def replace_link(match: re.Match[str]) -> str:
+            label = match.group(1)
+            raw_target = html.unescape(match.group(2))
+            target = link_rewriter(raw_target) if link_rewriter else safe_html_link_target(raw_target)
+            if target is None:
+                return f'<span data-unsafe-link="true">{label}</span>'
+            return f'<a href="{html.escape(target, quote=True)}">{label}</a>'
+
+        escaped = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", replace_link, escaped)
         escaped = re.sub(r"\[\[([^\]|]+)\|([^\]]+)\]\]", r"<span data-wikilink=\"\1\">\2</span>", escaped)
         escaped = re.sub(r"\[\[([^\]]+)\]\]", r"<span data-wikilink=\"\1\">\1</span>", escaped)
         return escaped
@@ -630,12 +950,26 @@ def markdown_to_semantic_html(markdown: str) -> str:
             return
         rows = [row for row in table_rows if row.strip()]
         out.append("<table>")
-        for index, row in enumerate(rows):
-            cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
-            if index == 1 and all(set(cell.replace(":", "").strip()) <= {"-"} for cell in cells):
-                continue
-            tag = "th" if index == 0 and len(rows) > 1 else "td"
-            out.append("<tr>" + "".join(f"<{tag}>{inline(cell)}</{tag}>" for cell in cells) + "</tr>")
+        parsed_rows = [[cell.strip() for cell in row.strip().strip("|").split("|")] for row in rows]
+        has_header = (
+            len(parsed_rows) >= 2
+            and all(set(cell.replace(":", "").strip()) <= {"-"} and cell.replace(":", "").strip() for cell in parsed_rows[1])
+        )
+        if has_header:
+            out.append("<thead>")
+            out.append("<tr>" + "".join(f"<th>{inline(cell)}</th>" for cell in parsed_rows[0]) + "</tr>")
+            out.append("</thead>")
+            body_rows = parsed_rows[2:]
+            if body_rows:
+                out.append("<tbody>")
+                for cells in body_rows:
+                    out.append("<tr>" + "".join(f"<td>{inline(cell)}</td>" for cell in cells) + "</tr>")
+                out.append("</tbody>")
+        else:
+            out.append("<tbody>")
+            for cells in parsed_rows:
+                out.append("<tr>" + "".join(f"<td>{inline(cell)}</td>" for cell in cells) + "</tr>")
+            out.append("</tbody>")
         out.append("</table>")
         in_table = False
         table_rows = []
@@ -646,7 +980,32 @@ def markdown_to_semantic_html(markdown: str) -> str:
         close_blockquote()
         close_table()
 
+    def close_section() -> None:
+        nonlocal open_section
+        if open_section:
+            close_blocks()
+            out.append("</section>")
+            open_section = False
+
+    def open_heading_section(section: dict[str, Any]) -> None:
+        nonlocal open_section
+        if open_section:
+            out.append("</section>")
+        attrs = {
+            "id": f"section-{section['section_id']}",
+            "data-section-id": section["section_id"],
+            "data-heading-path": " > ".join(section["heading_path"]),
+            "data-page-path": page_path,
+            "data-confidence": metadata.get("confidence", "unknown"),
+            "data-contested": str(bool(metadata.get("contested", False))).lower(),
+        }
+        attr_text = " ".join(f'{key}="{html.escape(str(value), quote=True)}"' for key, value in attrs.items())
+        out.append(f"<section {attr_text}>")
+        open_section = True
+
     for raw in lines:
+        line_start = cursor
+        cursor += len(raw) + 1
         line = raw.rstrip()
         if line.startswith("```"):
             if in_code:
@@ -674,7 +1033,24 @@ def markdown_to_semantic_html(markdown: str) -> str:
         if heading:
             close_blocks()
             level = len(heading.group(1))
-            out.append(f"<h{level}>{inline(heading.group(2))}</h{level}>")
+            while heading_stack and heading_stack[-1][0] >= level:
+                heading_stack.pop()
+            title = heading.group(2).strip()
+            heading_stack.append((level, title))
+            occurrence_key = tuple(item[1] for item in heading_stack)
+            heading_occurrences[occurrence_key] += 1
+            section = section_lookup.get(line_start)
+            if section:
+                open_heading_section(section)
+                heading_id = str(section["section_id"])
+            else:
+                heading_id = heading_anchor(
+                    page_path,
+                    [item[1] for item in heading_stack],
+                    title,
+                    heading_occurrences[occurrence_key],
+                )
+            out.append(f'<h{level} id="{html.escape(heading_id, quote=True)}">{inline(title)}</h{level}>')
             continue
         if line.startswith(">"):
             close_paragraph()
@@ -699,6 +1075,7 @@ def markdown_to_semantic_html(markdown: str) -> str:
     if in_code:
         out.append("<pre><code>" + html.escape("\n".join(code_lines)) + "</code></pre>")
     close_blocks()
+    close_section()
     return "\n".join(out)
 
 
@@ -907,23 +1284,33 @@ def artifact_matches(current: Any, expected: Any) -> bool:
 
 def page_lookup(pages: list[dict[str, Any]]) -> dict[str, str]:
     lookup: dict[str, str] = {}
+    owners: dict[str, str] = {}
     for page in pages:
         path = str(page.get("path", ""))
         if not path:
             continue
-        keys = {
-            path,
-            Path(path).stem,
-            str(page.get("slug", "")),
-            str(page.get("title", "")),
-        }
+        keys: list[tuple[str, bool]] = [
+            (path, False),
+            (Path(path).stem, False),
+            (str(page.get("slug", "")), True),
+            (str(page.get("title", "")), True),
+        ]
         for alias in normalize_list(page.get("aliases")):
-            keys.add(alias)
-        for key in keys:
+            keys.append((alias, True))
+        for key, add_slug_variant in keys:
             normalized = key.strip().lower()
             if normalized:
-                lookup[normalized] = path
-                lookup[slugify(normalized)] = path
+                variants = {normalized}
+                if add_slug_variant:
+                    slug = slugify(normalized)
+                    if slug != "untitled" or normalized == "untitled":
+                        variants.add(slug)
+                for variant in variants:
+                    owner = owners.get(variant)
+                    if owner and owner != path:
+                        raise ValueError(f"identifier collision {variant!r}: {owner} and {path}")
+                    owners[variant] = path
+                    lookup[variant] = path
     return lookup
 
 
@@ -1014,6 +1401,8 @@ def retrieve(
     profile: str | None = None,
     include_unprofiled: bool = False,
 ) -> list[dict[str, Any]]:
+    if limit <= 0:
+        raise ValueError("limit must be a positive integer")
     profiles: dict[str, dict[str, Any]] = {}
     if profile:
         profiles, profile_errors = load_profiles(root)
@@ -1201,6 +1590,7 @@ def read_jsonl(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
 def write_report(root: Path, kind: str, name: str, markdown: str, data: dict[str, Any] | None = None) -> tuple[Path, Path | None]:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     report_dir = root / "reports" / kind
+    confined_output_path(root, report_dir, scope="wiki root")
     report_dir.mkdir(parents=True, exist_ok=True)
     base_stem = f"{timestamp}-{slugify(name)}"
     stem = base_stem
@@ -1209,9 +1599,11 @@ def write_report(root: Path, kind: str, name: str, markdown: str, data: dict[str
         suffix += 1
         stem = f"{base_stem}-{suffix}"
     md_path = report_dir / f"{stem}.md"
+    confined_output_path(root, md_path, scope="wiki root")
     md_path.write_text(markdown.rstrip() + "\n", encoding="utf-8")
     json_path = None
     if data is not None:
         json_path = report_dir / f"{stem}.json"
+        confined_output_path(root, json_path, scope="wiki root")
         write_json(json_path, data)
     return md_path, json_path

@@ -30,23 +30,28 @@ Do not treat a retrieval hit as proof that a claim is true. It only selects cand
 
 For agent task execution, prefer a generated context pack over ad hoc full-page reads when the user asks for bounded task/query context. Use `scripts/build_context_pack.py` after deterministic retrieval. A context pack records:
 
-- the query, retrieval mode, profile filters, limit, and excerpt budget;
+- the query, retrieval mode, profile filters, positive limit, aggregate per-page excerpt budget, and maximum chunks per page;
 - seed hits and one-hop context hits separately;
 - page path, title, summary, confidence, contested status, profiles, sources, scores, match type, reasons, and reason counts;
-- bounded excerpts from canonical Markdown page bodies.
+- bounded page excerpts from canonical Markdown page bodies, with combined page/chunk excerpt characters capped by the per-page budget;
+- localized section/chunk payloads with stable `chunk_id`, `section_id`, heading path, character offsets, excerpt hash, sources, confidence, contested status, match type, scores, reasons, and reason counts.
 
 Context packs are generated artifacts under `reports/context-packs/`. They are not canonical memory and may be deleted and rebuilt. If a context pack surfaces `confidence=low`, `confidence=unknown`, or `contested=true`, the agent must carry that uncertainty into the answer.
 
+`--limit`, `--max-chars-per-page`, and `--max-chunks-per-page` require positive integers. `max_chars_per_page` covers the combined page excerpt plus localized chunk excerpts; output reports `excerpt_chars_used` and `truncated` for auditability.
+
 ## MCP Agent Access
 
-For agent systems, prefer the generated MCP bundle under `reports/publish/mcp/` as the stable access layer. MCP tools must use the same deterministic file-first retrieval contract:
+For agent systems, prefer the generated executable MCP bundle and companion Skill under `reports/publish/mcp/` as the stable access layer. MCP tools must use the same deterministic file-first retrieval contract:
 
 - `wiki_search` returns seed and one-hop context hits with scores, match type, reasons, confidence, contested status, profiles, and citations.
-- `wiki_read` may read published Markdown, semantic HTML, or metadata, but must stay path-confined to the wiki root or snapshot root.
-- `wiki_context_pack` generates bounded context packs instead of exposing whole-wiki dumps.
-- `wiki_quality_report` surfaces validation, health, retrieval eval, and freshness status before an agent relies on the wiki.
+- `wiki_read` may read published Markdown, semantic HTML, or metadata, but must stay path-confined to the wiki root or snapshot root and expose content hash plus canonical/generated and section-index metadata when available.
+- `wiki_context_pack` generates bounded context packs with localized chunks instead of exposing whole-wiki dumps.
+- `wiki_quality_report` surfaces validation, health, retrieval eval, freshness status, readiness level, unsafe-to-answer status, blocking reasons, stale artifacts, and profile quality before an agent relies on the wiki.
 
 MCP access does not make retrieval hits true claims. Agents must still cite wiki page paths, preserve uncertainty, and report misses when deterministic retrieval lacks adequate memory.
+
+Select context-pack sections by deterministic relevance to glossary-expanded query terms, then emit selected chunks in document order. Do not select the earliest headings merely because they appear first.
 
 ## Bilingual And Mixed-Script Matching
 
